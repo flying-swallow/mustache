@@ -348,3 +348,36 @@ test "mustachejs: null_lookup_object" {
         \\Squid's favorite show: none.
     ++ "\n");
 }
+
+// The static render path tracks the ancestor chain in a comptime tuple, but
+// caps it at STATIC_PARENTS_MAX (8) levels; deeper sections fall back to the
+// type-erased VM. These nest 10 struct sections to cross that boundary and
+// assert parent-scope lookups still resolve across the static->VM handoff.
+
+test "context: parent scope survives beyond STATIC_PARENTS_MAX" {
+    const tmpl =
+        "{{#l1}}{{#l2}}{{#l3}}{{#l4}}{{#l5}}{{#l6}}{{#l7}}{{#l8}}{{#l9}}{{#l10}}" ++
+        "[{{root_field}}|{{shallow_field}}|{{deep_field}}]" ++
+        "{{/l10}}{{/l9}}{{/l8}}{{/l7}}{{/l6}}{{/l5}}{{/l4}}{{/l3}}{{/l2}}{{/l1}}";
+    const data = .{
+        .root_field = "R",
+        .l1 = .{ .shallow_field = "S", .l2 = .{ .l3 = .{ .l4 = .{ .l5 = .{
+            .l6 = .{ .l7 = .{ .l8 = .{ .l9 = .{ .l10 = .{ .deep_field = "D" } } } } } } } } } },
+    };
+    try expectRender(tmpl, &.{}, data, "[R|S|D]");
+    try expectRenderComptime(tmpl, &.{}, data, "[R|S|D]");
+}
+
+test "context: nearest scope wins across the static/VM boundary" {
+    const tmpl =
+        "{{#l1}}{{#l2}}{{#l3}}{{#l4}}{{#l5}}{{#l6}}{{#l7}}{{#l8}}{{#l9}}{{#l10}}" ++
+        "{{who}}" ++
+        "{{/l10}}{{/l9}}{{/l8}}{{/l7}}{{/l6}}{{/l5}}{{/l4}}{{/l3}}{{/l2}}{{/l1}}";
+    const data = .{
+        .who = "root",
+        .l1 = .{ .l2 = .{ .l3 = .{ .l4 = .{ .l5 = .{ .l6 = .{ .l7 = .{ .l8 = .{
+            .l9 = .{ .l10 = .{ .who = "leaf" } } } } } } } } } },
+    };
+    try expectRender(tmpl, &.{}, data, "leaf");
+    try expectRenderComptime(tmpl, &.{}, data, "leaf");
+}

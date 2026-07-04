@@ -3,9 +3,9 @@
 //! A `Context` is a fat pointer (value pointer plus a vtable generated at
 //! comptime for the value's concrete type) that views the user's data in
 //! place — no intermediate tree, no allocation, no copies. Structs are
-//! objects, tuples/slices/arrays/vectors are arrays, valid-UTF-8 u8
-//! sequences are strings, and ints/floats/bools/enums/error values are
-//! scalars.
+//! objects, tuples/slices/arrays/vectors are arrays, u8 sequences are
+//! strings (no UTF-8 validation — bytes pass through verbatim), and
+//! ints/floats/bools/enums/error values are scalars.
 //!
 //! Type erasure (rather than a typed context chain) is load-bearing: the
 //! renderer keeps a homogeneous frame stack, and recursive partials over
@@ -29,22 +29,21 @@ pub const Context = struct {
         /// for array-likes (null past the end, so an inverted section over an
         /// empty array keeps the parent context), the value itself otherwise.
         element: *const fn (*const anyopaque, usize) ?Context,
-        /// Object (struct) key lookup; null for non-objects / missing keys.
-        get: *const fn (*const anyopaque, []const u8) ?Context,
         /// Writes the value's text form (nothing for null and composites),
         /// HTML-escaping if requested.
         write: *const fn (*const anyopaque, *Writer, bool) Writer.Error!void,
-        /// Hot-path combination of `get` + `write`: resolves object key `key`
-        /// (with `hash == fieldHash(key)` pre-checked by the caller) and writes
-        /// its text directly, skipping the intermediate `Context`. Returns true
-        /// if the key was present (even a present-but-null value that writes
-        /// nothing), false if it is not a key of this object. Non-objects and
-        /// missing keys return false, mirroring `get`.
-        getWrite: *const fn (*const anyopaque, u32, []const u8, *Writer, bool) Writer.Error!bool,
-        /// Like `get`, but with a precomputed `hash == fieldHash(key)` so the
-        /// field scan rejects non-matches with a u32 compare before the byte
-        /// compare. Used by the renderer's precomputed dotted-path resolution.
-        getHash: *const fn (*const anyopaque, u32, []const u8) ?Context,
+        /// Hot-path combination of `getHash` + `write`: resolves the object
+        /// key whose name hashes to `hash` (a precomputed, trusted
+        /// `fieldHash`) and writes its text directly, skipping the
+        /// intermediate `Context`. Returns true if the key was present (even
+        /// a present-but-null value that writes nothing), false if it is not
+        /// a key of this object. Non-objects and missing keys return false,
+        /// mirroring `getHash`.
+        getWrite: *const fn (*const anyopaque, u32, *Writer, bool) Writer.Error!bool,
+        /// Object (struct) key lookup, dispatched on a precomputed
+        /// `hash == fieldHash(key)`, which is trusted without a byte compare;
+        /// null for non-objects / missing keys.
+        getHash: *const fn (*const anyopaque, u32) ?Context,
     };
 
     /// Identity for the renderer's repeated-context skip. The vtable pointer
@@ -62,18 +61,14 @@ pub const Context = struct {
         return c.vtable.element(c.ptr, i);
     }
 
-    pub fn getKey(c: Context, key: []const u8) ?Context {
-        return c.vtable.get(c.ptr, key);
-    }
-
     /// Key lookup with a precomputed hash; see `VTable.getHash`.
-    pub fn getKeyHash(c: Context, hash: u32, key: []const u8) ?Context {
-        return c.vtable.getHash(c.ptr, hash, key);
+    pub fn getKeyHash(c: Context, hash: u32) ?Context {
+        return c.vtable.getHash(c.ptr, hash);
     }
 
     /// Combined key lookup and write; see `VTable.getWrite`.
-    pub fn getKeyWrite(c: Context, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
-        return c.vtable.getWrite(c.ptr, hash, key, w, escape);
+    pub fn getKeyWrite(c: Context, hash: u32, w: *Writer, escape: bool) Writer.Error!bool {
+        return c.vtable.getWrite(c.ptr, hash, w, escape);
     }
 
     pub fn write(c: Context, w: *Writer, escape: bool) Writer.Error!void {
@@ -165,21 +160,16 @@ const null_vtable: Context.VTable = .{
             return null_context;
         }
     }.f,
-    .get = struct {
-        fn f(_: *const anyopaque, _: []const u8) ?Context {
-            return null;
-        }
-    }.f,
     .write = struct {
         fn f(_: *const anyopaque, _: *Writer, _: bool) Writer.Error!void {}
     }.f,
     .getWrite = struct {
-        fn f(_: *const anyopaque, _: u32, _: []const u8, _: *Writer, _: bool) Writer.Error!bool {
+        fn f(_: *const anyopaque, _: u32, _: *Writer, _: bool) Writer.Error!bool {
             return false;
         }
     }.f,
     .getHash = struct {
-        fn f(_: *const anyopaque, _: u32, _: []const u8) ?Context {
+        fn f(_: *const anyopaque, _: u32) ?Context {
             return null;
         }
     }.f,
@@ -189,8 +179,9 @@ const null_vtable: Context.VTable = .{
 /// pre-hashes tag names at parse time (stored in `Instruction.offset`) and
 /// dispatches field lookup by comparing against `comptime fieldHash(field_name)`;
 /// both sides must agree, so they share this one function (Wyhash yields the
-/// same value at comptime and runtime). A hash match is always confirmed with a
-/// byte compare, so collisions are harmless.
+/// same value at comptime and runtime). A hash match is trusted without a
+/// byte compare, so lookup relies on the hash being collision-free across an
+/// object's field names.
 pub fn fieldHash(name: []const u8) u32 {
     return @truncate(std.hash.Wyhash.hash(0, name));
 }
@@ -214,8 +205,8 @@ pub fn directlyWritable(comptime F: type) bool {
 /// must match the corresponding prong of `Impl.writeFn`.
 pub fn writeValue(comptime F: type, ptr: *const F, w: *Writer, escape: bool) Writer.Error!void {
     switch (@typeInfo(F)) {
-        .array => try byteWrite(ptr, w, escape), // child == u8
-        .pointer => try byteWrite(ptr.*, w, escape), // slice, child == u8
+        .array => try writeString(w, ptr, escape), // child == u8
+        .pointer => try writeString(w, ptr.*, escape), // slice, child == u8
         .int => try w.print("{d}", .{ptr.*}),
         .float => try w.print("{d}", .{ptr.*}),
         .bool => try w.writeAll(if (ptr.*) "true" else "false"),
@@ -227,14 +218,14 @@ pub fn writeValue(comptime F: type, ptr: *const F, w: *Writer, escape: bool) Wri
 
 /// Shared struct field-scan + write, used by both the type-erased
 /// `Impl.getWriteFn` vtable entry and the monomorphic static renderer
-/// (`render.zig`). Finds the field of `T` whose name hashes to `hash`
-/// (confirmed by a byte compare, so collisions are harmless) and writes it:
-/// leaf fields go straight through `writeValue` (no `Context`, no second
-/// dispatch); optionals / unions / pointers-to-one / nested objects / packed
-/// and comptime fields fall back to the general `get` + `write` path so
-/// behaviour is identical to `getKey(...).?.write(...)`. Returns true iff `key`
-/// names a field of `T` (even a present-but-null one that writes nothing).
-pub fn writeField(comptime T: type, ptr: *const T, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
+/// (`render.zig`). Finds the field of `T` whose name hashes to `hash` (a
+/// precomputed, trusted `fieldHash`) and writes it: leaf fields go straight
+/// through `writeValue` (no `Context`, no second dispatch); optionals /
+/// unions / pointers-to-one / nested objects / packed and comptime fields
+/// fall back to the general `get` + `write` path so behaviour is identical
+/// to `getKeyHash(...).?.write(...)`. Returns true iff `hash` names a field of
+/// `T` (even a present-but-null one that writes nothing).
+pub fn writeField(comptime T: type, ptr: *const T, hash: u32, w: *Writer, escape: bool) Writer.Error!bool {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
             if (comptime info.is_tuple) return false;
@@ -244,8 +235,8 @@ pub fn writeField(comptime T: type, ptr: *const T, hash: u32, key: []const u8, w
                         if (comptime !attrs.@"comptime" and info.layout != .@"packed" and directlyWritable(F)) {
                             try writeValue(F, &@field(ptr.*, name), w, escape);
                         } else {
-                            // getFn matches the same field, so `.?` holds.
-                            try Impl(T).getFn(@ptrCast(ptr), key).?.write(w, escape);
+                            // getHashFn matches the same field, so `.?` holds.
+                            try Impl(T).getHashFn(@ptrCast(ptr), hash).?.write(w, escape);
                         }
                         return true;
                     }
@@ -257,20 +248,12 @@ pub fn writeField(comptime T: type, ptr: *const T, hash: u32, key: []const u8, w
     }
 }
 
-/// A u8 sequence is a string when it is valid UTF-8 and an array of bytes
-/// otherwise, decided at render time; only the string form has a text value.
-fn byteWrite(s: []const u8, w: *Writer, escape: bool) Writer.Error!void {
-    if (!std.unicode.utf8ValidateSlice(s)) return;
-    try writeString(w, s, escape);
-}
-
 /// Generates the vtable for a concrete (already-unwrapped) type `T`.
 fn Impl(comptime T: type) type {
     return struct {
         pub const vtable: Context.VTable = .{
             .count = countFn,
             .element = elementFn,
-            .get = getFn,
             .write = writeFn,
             .getWrite = getWriteFn,
             .getHash = getHashFn,
@@ -287,12 +270,13 @@ fn Impl(comptime T: type) type {
         fn countFn(ptr: *const anyopaque) usize {
             switch (@typeInfo(T)) {
                 .@"struct" => |info| return if (info.is_tuple) info.field_names.len else 1,
+                // A u8 sequence is a string: truthy iff non-empty.
                 .array => |info| return if (comptime info.child == u8)
-                    byteCount(self(ptr))
+                    @intFromBool(self(ptr).len != 0)
                 else
                     info.len,
                 .pointer => |info| return if (comptime info.child == u8)
-                    byteCount(self(ptr).*)
+                    @intFromBool(self(ptr).len != 0)
                 else
                     self(ptr).len,
                 .vector => |info| return info.len,
@@ -315,14 +299,15 @@ fn Impl(comptime T: type) type {
                     }
                     return null;
                 },
+                // A section over a string keeps the string itself as context.
                 .array => |info| {
+                    if (comptime info.child == u8) return selfContext(ptr);
                     const s = self(ptr);
-                    if (comptime info.child == u8) return byteElement(s, ptr, i);
                     return if (i < info.len) Context.init(&s[i]) else null;
                 },
                 .pointer => |info| {
+                    if (comptime info.child == u8) return selfContext(ptr);
                     const s = self(ptr).*;
-                    if (comptime info.child == u8) return byteElement(s, ptr, i);
                     return if (i < s.len) Context.init(&s[i]) else null;
                 },
                 .vector => |info| {
@@ -343,14 +328,16 @@ fn Impl(comptime T: type) type {
             }
         }
 
-        fn getFn(ptr: *const anyopaque, key: []const u8) ?Context {
+        /// Object key lookup; `hash` is a precomputed, trusted `fieldHash`
+        /// (see `VTable.getHash`).
+        fn getHashFn(ptr: *const anyopaque, hash: u32) ?Context {
             switch (@typeInfo(T)) {
                 .@"struct" => |info| {
                     if (comptime info.is_tuple) return null;
                     inline for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
                         // void fields are not keys.
                         if (comptime F != void) {
-                            if (std.mem.eql(u8, key, name)) {
+                            if (hash == (comptime fieldHash(name))) {
                                 if (comptime attrs.@"comptime") {
                                     // Comptime fields (all fields of anonymous
                                     // literals) have no runtime address; their
@@ -379,43 +366,11 @@ fn Impl(comptime T: type) type {
             }
         }
 
-        /// `getFn` with a precomputed `hash == fieldHash(key)` pre-check, so a
-        /// non-matching field is rejected by a u32 compare before the byte
-        /// compare. Behaviour is otherwise identical to `getFn`.
-        fn getHashFn(ptr: *const anyopaque, hash: u32, key: []const u8) ?Context {
-            switch (@typeInfo(T)) {
-                .@"struct" => |info| {
-                    if (comptime info.is_tuple) return null;
-                    inline for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
-                        if (comptime F != void) {
-                            if (hash == (comptime fieldHash(name)) and std.mem.eql(u8, key, name)) {
-                                if (comptime attrs.@"comptime") {
-                                    if (comptime F == @TypeOf(null)) return null_context;
-                                    return comptimeValue(attrs.defaultValue(F).?);
-                                } else if (comptime info.layout == .@"packed") {
-                                    const load = struct {
-                                        fn f(p: *const T) F {
-                                            return @field(p.*, name);
-                                        }
-                                    }.f;
-                                    return .{ .ptr = ptr, .vtable = &ByValue(T, F, load).vtable };
-                                } else {
-                                    return Context.init(&@field(self(ptr).*, name));
-                                }
-                            }
-                        }
-                    }
-                    return null;
-                },
-                else => return null,
-            }
-        }
-
         /// Hot-path field lookup + write; the shared `writeField` does the work
         /// (also called directly, without this vtable hop, by the static
         /// renderer in `render.zig`).
-        fn getWriteFn(ptr: *const anyopaque, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
-            return writeField(T, self(ptr), hash, key, w, escape);
+        fn getWriteFn(ptr: *const anyopaque, hash: u32, w: *Writer, escape: bool) Writer.Error!bool {
+            return writeField(T, self(ptr), hash, w, escape);
         }
 
         fn writeFn(ptr: *const anyopaque, w: *Writer, escape: bool) Writer.Error!void {
@@ -424,9 +379,9 @@ fn Impl(comptime T: type) type {
                 // serialized them as JSON; not supported).
                 .@"struct", .vector => {},
                 .array => |info| if (comptime info.child == u8)
-                    try byteWrite(self(ptr), w, escape),
+                    try writeString(w, self(ptr), escape),
                 .pointer => |info| if (comptime info.child == u8)
-                    try byteWrite(self(ptr).*, w, escape),
+                    try writeString(w, self(ptr).*, escape),
                 .int => try w.print("{d}", .{self(ptr).*}),
                 .float => try w.print("{d}", .{self(ptr).*}),
                 .bool => try w.writeAll(if (self(ptr).*) "true" else "false"),
@@ -444,18 +399,6 @@ fn Impl(comptime T: type) type {
                 return comptimeValue(info.field_attrs[j].defaultValue(F).?);
             return Context.init(&s.*[j]);
         }
-
-        /// A u8 sequence is a string when it is valid UTF-8 and an array of
-        /// bytes otherwise, decided at render time.
-        fn byteCount(s: []const u8) usize {
-            if (std.unicode.utf8ValidateSlice(s)) return @intFromBool(s.len != 0);
-            return s.len;
-        }
-
-        fn byteElement(s: []const u8, ptr: *const anyopaque, i: usize) ?Context {
-            if (std.unicode.utf8ValidateSlice(s)) return selfContext(ptr);
-            return if (i < s.len) Context.init(&s[i]) else null;
-        }
     };
 }
 
@@ -468,7 +411,6 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
         pub const vtable: Context.VTable = .{
             .count = countFn,
             .element = elementFn,
-            .get = getFn,
             .write = writeFn,
             .getWrite = getWriteFn,
             .getHash = getHashFn,
@@ -479,38 +421,24 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
         }
 
         /// Packed / by-value fields are never the render hot path, so this just
-        /// defers to the general `getFn` + `write`.
-        fn getWriteFn(ptr: *const anyopaque, _: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
-            if (getFn(ptr, key)) |c| {
+        /// defers to the general `getHashFn` + `write`.
+        fn getWriteFn(ptr: *const anyopaque, hash: u32, w: *Writer, escape: bool) Writer.Error!bool {
+            if (getHashFn(ptr, hash)) |c| {
                 try c.write(w, escape);
                 return true;
             }
             return false;
         }
 
-        /// Packed / by-value fields are never the render hot path; defer to the
-        /// string-based `getFn`.
-        fn getHashFn(ptr: *const anyopaque, _: u32, key: []const u8) ?Context {
-            return getFn(ptr, key);
-        }
-
-        fn countFn(ptr: *const anyopaque) usize {
-            const v = load(self(ptr));
-            return Impl(F).vtable.count(@ptrCast(&v));
-        }
-
-        fn elementFn(ptr: *const anyopaque, _: usize) ?Context {
-            // A section over a scalar keeps the value itself as context.
-            return .{ .ptr = ptr, .vtable = &vtable };
-        }
-
-        fn getFn(ptr: *const anyopaque, key: []const u8) ?Context {
+        /// Field lookup over a packed / by-value struct; `hash` is a
+        /// precomputed, trusted `fieldHash` (see `VTable.getHash`).
+        fn getHashFn(ptr: *const anyopaque, hash: u32) ?Context {
             switch (@typeInfo(F)) {
                 .@"struct" => |info| {
                     if (comptime info.is_tuple) return null;
                     inline for (info.field_names, info.field_types) |name, FF| {
                         if (comptime FF != void) {
-                            if (std.mem.eql(u8, key, name)) {
+                            if (hash == (comptime fieldHash(name))) {
                                 const inner = struct {
                                     fn f(p: *const Parent) FF {
                                         return @field(load(p), name);
@@ -526,6 +454,16 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
             }
         }
 
+        fn countFn(ptr: *const anyopaque) usize {
+            const v = load(self(ptr));
+            return Impl(F).vtable.count(@ptrCast(&v));
+        }
+
+        fn elementFn(ptr: *const anyopaque, _: usize) ?Context {
+            // A section over a scalar keeps the value itself as context.
+            return .{ .ptr = ptr, .vtable = &vtable };
+        }
+
         fn writeFn(ptr: *const anyopaque, w: *Writer, escape: bool) Writer.Error!void {
             const v = load(self(ptr));
             return Impl(F).vtable.write(@ptrCast(&v), w, escape);
@@ -533,17 +471,45 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
     };
 }
 
+/// Vector width for the escape scan (0 disables the vector path on targets
+/// without usable SIMD registers).
+const escape_vec_len = std.simd.suggestVectorLength(u8) orelse 0;
+
 fn writeString(w: *Writer, s: []const u8, escape: bool) Writer.Error!void {
     if (!escape) return w.writeAll(s);
     // Copy runs of non-escaped bytes in bulk, emitting an entity only at each
-    // byte that needs escaping. The scan reads a single byte per input byte
-    // from a compact 256-byte flag table (cache-friendlier than a table of
-    // slices) and only maps the byte to its entity on the rare escape hit.
+    // byte that needs escaping. Whole vector-width chunks are pre-screened
+    // with SIMD compares folded into a single `@reduce` test — escapes are
+    // rare, so most chunks are skipped at ~one branch per chunk. Chunks with
+    // a hit and the sub-vector tail go byte-at-a-time through the flag table.
+    // (Combining the compares as vectors and reducing once is deliberate: a
+    // per-compare movemask/`@bitCast`-to-int is cheap on x86 but expands to a
+    // multi-instruction sequence on NEON, and benched slower than the scalar
+    // loop.)
     var start: usize = 0;
-    for (s, 0..) |c, i| {
-        if (html_escape_flags[c]) {
+    var i: usize = 0;
+    if (comptime escape_vec_len > 0) {
+        const n = escape_vec_len;
+        const V = @Vector(n, u8);
+        while (i + n <= s.len) : (i += n) {
+            const chunk: V = s[i..][0..n].*;
+            var hits = @intFromBool(chunk == @as(V, @splat(@as(u8, html_escape_chars[0]))));
+            inline for (html_escape_chars[1..]) |c|
+                hits |= @intFromBool(chunk == @as(V, @splat(@as(u8, c))));
+            if (@reduce(.Or, hits) == 0) continue;
+            for (i..i + n) |j| {
+                if (html_escape_flags[s[j]]) {
+                    if (j > start) try w.writeAll(s[start..j]);
+                    try w.writeAll(htmlEntity(s[j]));
+                    start = j + 1;
+                }
+            }
+        }
+    }
+    while (i < s.len) : (i += 1) {
+        if (html_escape_flags[s[i]]) {
             if (i > start) try w.writeAll(s[start..i]);
-            try w.writeAll(htmlEntity(c));
+            try w.writeAll(htmlEntity(s[i]));
             start = i + 1;
         }
     }
@@ -551,10 +517,13 @@ fn writeString(w: *Writer, s: []const u8, escape: bool) Writer.Error!void {
 }
 
 /// mustache.js's `entityMap` keys: the HTML metacharacters plus backtick, '='
-/// and '/'. `html_escape_flags[c]` is true iff byte `c` must be escaped.
+/// and '/'.
+const html_escape_chars = "&<>\"'`=/";
+
+/// `html_escape_flags[c]` is true iff byte `c` must be escaped.
 const html_escape_flags: [256]bool = blk: {
     var table: [256]bool = @splat(false);
-    for ("&<>\"'`=/") |c| table[c] = true;
+    for (html_escape_chars) |c| table[c] = true;
     break :blk table;
 };
 

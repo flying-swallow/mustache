@@ -46,16 +46,17 @@ pub const Instruction = struct {
     /// Section instructions: index of the matching `section_end`.
     /// `section_goto`: its own index. `padding_push`: previous padding head.
     end: u32 = 0,
-    /// Section instructions: byte length of the section body.
     /// `section_goto`: instruction index of the target `section_start`.
+    /// `write_path` and named sections: number of pre-hashed path segments
+    /// (see `offset`); 0 = implicit/empty, told apart by `name_len`.
     len: u32 = 0,
     /// Offset into `Template.data` of the name / text / padding bytes.
     name_pos: u32 = NO_NAME,
     /// Length of the name / text / padding bytes.
     name_len: u32 = 0,
-    /// Sections: distance from the name start to the section body start.
     /// `write_arg` / `write_arg_unescaped`: `context.fieldHash` of the tag
-    /// name, for the renderer's fast field lookup.
+    /// name, for the renderer's fast field lookup. `write_path` and named
+    /// sections: start index into `Template.path_segs`.
     offset: u32 = 0,
 };
 
@@ -520,11 +521,15 @@ const Loader = struct {
                 const frame = &l.stack[l.index];
                 frame.open_sections += 1;
                 if (frame.open_sections >= NESTING_LIMIT) return error.TooDeep;
+                // Section names resolve like `write_path`: pre-split and
+                // pre-hashed at parse time.
+                const segs = try l.appendPathSegs(b, e);
                 try l.pushInstruction(.{
                     .op = if (sigil == '#') .section_start else .section_start_inv,
                     .name_pos = b,
                     .name_len = e - b,
-                    .offset = frame.data_pos - b,
+                    .offset = segs.start,
+                    .len = segs.count,
                 });
             },
             '>' => {
@@ -588,7 +593,6 @@ const Loader = struct {
                                 return error.ClosureMismatch;
                             }
                             insts[pos].end = @intCast(insts.len);
-                            insts[pos].len = tag_start - (insts[pos].name_pos + insts[pos].offset);
                             try l.pushInstruction(.{
                                 .op = .section_end,
                                 .end = insts[pos].end,

@@ -87,6 +87,22 @@ const parse_template =
     \\</html>
 ;
 
+// Section-rendering benchmark data for `parse_template`. A named struct type
+// (not an anonymous literal) so the fields are runtime values and the render
+// exercises the monomorphic static section path.
+const Post = struct { title: []const u8, date: []const u8, body: []const u8 };
+const BlogData = struct { title: []const u8, posts: []const Post };
+const section_data: BlogData = .{
+    .title = "My Blog",
+    .posts = &.{
+        .{ .title = "Hello, Mustache!", .date = "2026-07-01", .body = "This is a really simple test of the rendering!" },
+        .{ .title = "Sections at last", .date = "2026-07-02", .body = "Loops render without any vtable dispatch now." },
+        .{ .title = "One more post", .date = "2026-07-03", .body = "Three posts feels like a fair loop length." },
+    },
+};
+
+const SectionComptime = mustache.Comptime(.{ .data = parse_template });
+
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer if (builtin.mode == .Debug) {
@@ -108,6 +124,10 @@ pub fn main() !void {
     try partialTemplates(allocator, io, .Buffer);
     try partialTemplates(allocator, io, .Alloc);
     try partialTemplates(allocator, io, .Writer);
+
+    try sectionTemplates(allocator, io, .Buffer);
+    try sectionTemplates(allocator, io, .Alloc);
+    try sectionTemplates(allocator, io, .Writer);
 
     try parseTemplates(allocator, io);
 
@@ -142,6 +162,19 @@ fn partialTemplates(allocator: Allocator, io: std.Io, comptime mode: Mode) !void
     std.debug.print("----------------------------------\n", .{});
 
     _ = try repeat(io, "Partials", mode, "Mustache pre-parsed partials", renderTmpl, .{ allocator, mode, &m.template, data }, null);
+
+    std.debug.print("\n\n", .{});
+}
+
+fn sectionTemplates(allocator: Allocator, io: std.Io, comptime mode: Mode) !void {
+    var m = try mustache.Mustache.fromData(allocator, parse_template);
+    defer m.deinit();
+
+    std.debug.print("Mode {s}\n", .{@tagName(mode)});
+    std.debug.print("----------------------------------\n", .{});
+
+    _ = try repeat(io, "Sections", mode, "Mustache sections (runtime)", renderTmpl, .{ allocator, mode, &m.template, section_data }, null);
+    _ = try repeat(io, "Sections", mode, "Mustache sections (comptime)", renderTmpl, .{ allocator, mode, &SectionComptime.template, section_data }, null);
 
     std.debug.print("\n\n", .{});
 }

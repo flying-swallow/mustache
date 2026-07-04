@@ -92,7 +92,7 @@ for its type.
 | ----------------------------- | ---------------------------------------- |
 | struct with fields            | object (fields addressable via `{{a.b}}`) |
 | tuple / slice / array         | iterable list (for `{{#items}}`)         |
-| `[]const u8` (valid UTF-8)    | string (otherwise a list of bytes)       |
+| `[]const u8`                  | string (bytes pass through verbatim; no UTF-8 validation) |
 | optional                      | present value, or absent (`null`)        |
 | `bool`                        | truthy / falsy for sections              |
 | int / float                   | number                                   |
@@ -151,10 +151,11 @@ recursive partials), `partials`. A parse failure is a compile error.
 
 ## Benchmarks
 
-The benchmark renders a small template one million times across three output
+The benchmark renders small templates one million times across three output
 modes — a fixed buffer (`Buffer`), an allocating build (`Alloc`), and a
 discarding writer (`Writer`) — comparing a runtime-parsed and a comptime-parsed
-template against an equivalent `std.fmt` baseline, plus a parse-only pass.
+template against an equivalent `std.fmt` baseline, plus a section-heavy render
+and a parse-only pass.
 
 Reproduce with:
 
@@ -165,7 +166,7 @@ zig build bench -Doptimize=ReleaseFast
 Absolute numbers are machine-specific — the signal is the *ratio* between paths.
 The comptime path is the headline: the template is parsed at compile time, so
 rendering pays zero parse cost and allocates nothing for the template itself,
-landing within ~1.6–2.4× of hand-written `std.fmt` while remaining fully
+landing within ~1.4–1.8× of hand-written `std.fmt` while remaining fully
 data-driven.
 
 Numbers below were taken on an Apple M3 (macOS 15.7, Zig `0.17.0-dev`,
@@ -175,25 +176,46 @@ Numbers below were taken on an Apple M3 (macOS 15.7, Zig `0.17.0-dev`,
 
 | Run                            | Mode   | ns/iter |      ops/s |   MB/s | vs fmt |
 | ------------------------------ | ------ | ------: | ---------: | -----: | -----: |
-| Zig fmt (baseline)             | Buffer |    27.8 |   35921369 | 3871.1 |      - |
-| Mustache pre-parsed (runtime)  | Buffer |    67.3 |   14854960 | 1600.8 |  2.42x |
-| Mustache pre-parsed (comptime) | Buffer |    67.9 |   14735778 | 1588.0 |  2.44x |
-| Zig fmt (baseline)             | Alloc  |    56.0 |   17850064 | 1923.6 |      - |
-| Mustache pre-parsed (runtime)  | Alloc  |    91.7 |   10902609 | 1174.9 |  1.64x |
-| Mustache pre-parsed (comptime) | Alloc  |    86.9 |   11502268 | 1239.5 |  1.55x |
-| Zig fmt (baseline)             | Writer |    25.6 |   38994588 | 4202.3 |      - |
-| Mustache pre-parsed (runtime)  | Writer |    61.2 |   16336466 | 1760.5 |  2.39x |
-| Mustache pre-parsed (comptime) | Writer |    60.3 |   16576429 | 1786.4 |  2.35x |
+| Zig fmt (baseline)             | Buffer |    28.5 |   35074592 | 3779.8 |       - |
+| Mustache pre-parsed (runtime)  | Buffer |    48.4 |   20663042 | 2226.8 |  1.70x |
+| Mustache pre-parsed (comptime) | Buffer |    47.2 |   21170817 | 2281.5 |  1.66x |
+| Zig fmt (baseline)             | Alloc  |    51.5 |   19405449 | 2091.2 |       - |
+| Mustache pre-parsed (runtime)  | Alloc  |    72.1 |   13871806 | 1494.9 |  1.40x |
+| Mustache pre-parsed (comptime) | Alloc  |    71.5 |   13986430 | 1507.3 |  1.39x |
+| Zig fmt (baseline)             | Writer |    27.6 |   36187252 | 3899.7 |       - |
+| Mustache pre-parsed (runtime)  | Writer |    48.6 |   20562029 | 2215.9 |  1.76x |
+| Mustache pre-parsed (comptime) | Writer |    48.4 |   20677926 | 2228.4 |  1.75x |
 
 ### Partials
 
-| Run                          | Mode   | ns/iter |     ops/s |   MB/s |
-| ---------------------------- | ------ | ------: | --------: | -----: |
-| Mustache pre-parsed partials | Buffer |   108.8 |   9192222 | 1323.7 |
-| Mustache pre-parsed partials | Alloc  |   142.7 |   7007447 | 1009.1 |
-| Mustache pre-parsed partials | Writer |   121.1 |   8259750 | 1189.4 |
+| Run                            | Mode   | ns/iter |      ops/s |   MB/s | vs fmt |
+| ------------------------------ | ------ | ------: | ---------: | -----: | -----: |
+| Mustache pre-parsed partials   | Buffer |   102.2 |    9786300 | 1409.3 |       - |
+| Mustache pre-parsed partials   | Alloc  |   123.0 |    8128162 | 1170.5 |       - |
+| Mustache pre-parsed partials   | Writer |   101.7 |    9837654 | 1416.7 |       - |
 
-Parsing a small multi-section template (compile + discard) runs at ~453 ns/iter
+### Sections
+
+A blog-style template — a `{{#posts}}` loop over three posts — rendered
+against a concrete struct type, exercising the monomorphic static section
+path (loops dispatch with no vtable).
+
+| Run                            | Mode   | ns/iter |      ops/s |   MB/s | vs fmt |
+| ------------------------------ | ------ | ------: | ---------: | -----: | -----: |
+| Mustache sections (runtime)    | Buffer |   323.2 |    3093581 | 1820.3 |       - |
+| Mustache sections (comptime)   | Buffer |   316.0 |    3164726 | 1862.2 |       - |
+| Mustache sections (runtime)    | Alloc  |   369.4 |    2707306 | 1593.0 |       - |
+| Mustache sections (comptime)   | Alloc  |   376.4 |    2656771 | 1563.3 |       - |
+| Mustache sections (runtime)    | Writer |   322.7 |    3098537 | 1823.2 |       - |
+| Mustache sections (comptime)   | Writer |   318.0 |    3144652 | 1850.4 |       - |
+
+### Parse
+
+| Run                            | Mode   | ns/iter |      ops/s |   MB/s | vs fmt |
+| ------------------------------ | ------ | ------: | ---------: | -----: | -----: |
+| Parse (compile + discard)      | -      |   456.8 |    2189365 |  551.2 |       - |
+
+Parsing a small multi-section template (compile + discard) runs at ~457 ns/iter
 (≈2.2M ops/s), a cost the comptime path removes entirely.
 
 ## Testing

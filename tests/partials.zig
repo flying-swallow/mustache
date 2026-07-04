@@ -19,10 +19,11 @@ const std = @import("std");
 const h = @import("helper.zig");
 const expectRender = h.expectRender;
 const expectRenderComptime = h.expectRenderComptime;
-const expectRenderPartial = h.expectRenderPartial;
-const expectRenderPartialComptime = h.expectRenderPartialComptime;
 
 // -- Render fixtures (test/_files) --------------------------------------------
+//
+// The mustache.js render fixtures register their partial under the name
+// `partial`, so those cases pass `&.{.{ .name = "partial", .data = ... }}`.
 
 test "mustachejs: included_tag" {
     try expectRender(
@@ -41,15 +42,15 @@ test "mustachejs: included_tag" {
 
 test "mustachejs: partial_template" {
     // `title` was a constant-returning function.
-    try expectRenderPartial(
+    try expectRender(
         "<h1>{{title}}</h1>\n{{>partial}}\n",
-        "Again, {{again}}!\n",
+        &.{.{ .name = "partial", .data = "Again, {{again}}!\n" }},
         .{ .title = "Welcome", .again = "Goodbye" },
         "<h1>Welcome</h1>\nAgain, Goodbye!\n",
     );
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         "<h1>{{title}}</h1>\n{{>partial}}\n",
-        "Again, {{again}}!\n",
+        &.{.{ .name = "partial", .data = "Again, {{again}}!\n" }},
         .{ .title = "Welcome", .again = "Goodbye" },
         "<h1>Welcome</h1>\nAgain, Goodbye!\n",
     );
@@ -57,14 +58,15 @@ test "mustachejs: partial_template" {
 
 test "mustachejs: partial_view" {
     // `greeting`, `farewell` and `taxed_value` were constant functions.
-    try expectRenderPartial(
+    try expectRender(
         "<h1>{{greeting}}</h1>\n{{>partial}}\n<h3>{{farewell}}</h3>\n",
+        &.{.{ .name = "partial", .data =
         \\Hello {{name}}
         \\You have just won ${{value}}!
         \\{{#in_ca}}
         \\Well, ${{ taxed_value }}, after taxes.
         \\{{/in_ca}}
-    ,
+        }},
         .{
             .greeting = "Welcome",
             .farewell = "Fair enough, right?",
@@ -79,14 +81,15 @@ test "mustachejs: partial_view" {
         \\Well, $6000, after taxes.
         \\<h3>Fair enough, right?</h3>
     ++ "\n");
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         "<h1>{{greeting}}</h1>\n{{>partial}}\n<h3>{{farewell}}</h3>\n",
+        &.{.{ .name = "partial", .data =
         \\Hello {{name}}
         \\You have just won ${{value}}!
         \\{{#in_ca}}
         \\Well, ${{ taxed_value }}, after taxes.
         \\{{/in_ca}}
-    ,
+        }},
         .{
             .greeting = "Welcome",
             .farewell = "Fair enough, right?",
@@ -104,13 +107,14 @@ test "mustachejs: partial_view" {
 }
 
 test "mustachejs: partial_array" {
-    try expectRenderPartial(
+    try expectRender(
         "{{>partial}}",
+        &.{.{ .name = "partial", .data =
         \\Here's a non-sense array of values
         \\{{#array}}
         \\  {{.}}
         \\{{/array}}
-    ++ "\n",
+        ++ "\n" }},
         .{ .array = [_][]const u8{ "1", "2", "3", "4" } },
         \\Here's a non-sense array of values
         \\  1
@@ -118,13 +122,14 @@ test "mustachejs: partial_array" {
         \\  3
         \\  4
     ++ "\n");
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         "{{>partial}}",
+        &.{.{ .name = "partial", .data =
         \\Here's a non-sense array of values
         \\{{#array}}
         \\  {{.}}
         \\{{/array}}
-    ++ "\n",
+        ++ "\n" }},
         .{ .array = [_][]const u8{ "1", "2", "3", "4" } },
         \\Here's a non-sense array of values
         \\  1
@@ -135,75 +140,76 @@ test "mustachejs: partial_array" {
 }
 
 test "mustachejs: partial_array_of_partials" {
-    try expectRenderPartial(
+    try expectRender(
         \\Here is some stuff!
         \\{{#numbers}}
         \\{{>partial}}
         \\{{/numbers}}
     ++ "\n",
-        "{{i}}\n",
+        &.{.{ .name = "partial", .data = "{{i}}\n" }},
         .{ .numbers = .{ .{ .i = "1" }, .{ .i = "2" }, .{ .i = "3" }, .{ .i = "4" } } },
         "Here is some stuff!\n1\n2\n3\n4\n",
     );
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         \\Here is some stuff!
         \\{{#numbers}}
         \\{{>partial}}
         \\{{/numbers}}
     ++ "\n",
-        "{{i}}\n",
+        &.{.{ .name = "partial", .data = "{{i}}\n" }},
         .{ .numbers = .{ .{ .i = "1" }, .{ .i = "2" }, .{ .i = "3" }, .{ .i = "4" } } },
         "Here is some stuff!\n1\n2\n3\n4\n",
     );
 }
 
 test "mustachejs: partial_array_of_partials_implicit" {
-    try expectRenderPartial(
+    try expectRender(
         \\Here is some stuff!
         \\{{#numbers}}
         \\{{>partial}}
         \\{{/numbers}}
     ++ "\n",
-        "{{.}}\n",
+        &.{.{ .name = "partial", .data = "{{.}}\n" }},
         .{ .numbers = [_][]const u8{ "1", "2", "3", "4" } },
         "Here is some stuff!\n1\n2\n3\n4\n",
     );
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         \\Here is some stuff!
         \\{{#numbers}}
         \\{{>partial}}
         \\{{/numbers}}
     ++ "\n",
-        "{{.}}\n",
+        &.{.{ .name = "partial", .data = "{{.}}\n" }},
         .{ .numbers = [_][]const u8{ "1", "2", "3", "4" } },
         "Here is some stuff!\n1\n2\n3\n4\n",
     );
 }
 
 test "mustachejs: partial_empty" {
-    try expectRenderPartial(
+    try expectRender(
         "hey {{foo}}\n{{>partial}}\n",
-        "",
+        &.{.{ .name = "partial", .data = "" }},
         .{ .foo = 1 },
         "hey 1\n",
     );
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         "hey {{foo}}\n{{>partial}}\n",
-        "",
+        &.{.{ .name = "partial", .data = "" }},
         .{ .foo = 1 },
         "hey 1\n",
     );
 }
 
 test "mustachejs: partial_whitespace" {
-    try expectRenderPartial(
+    try expectRender(
         "<h1>{{  greeting  }}</h1>\n{{> partial }}\n<h3>{{ farewell }}</h3>\n",
+        &.{.{ .name = "partial", .data =
         \\Hello {{ name}}
         \\You have just won ${{value }}!
         \\{{# in_ca  }}
         \\Well, ${{ taxed_value }}, after taxes.
         \\{{/  in_ca }}
-    ,
+        }},
         .{
             .greeting = "Welcome",
             .farewell = "Fair enough, right?",
@@ -218,14 +224,15 @@ test "mustachejs: partial_whitespace" {
         \\Well, $6000, after taxes.
         \\<h3>Fair enough, right?</h3>
     ++ "\n");
-    try expectRenderPartialComptime(
+    try expectRenderComptime(
         "<h1>{{  greeting  }}</h1>\n{{> partial }}\n<h3>{{ farewell }}</h3>\n",
+        &.{.{ .name = "partial", .data =
         \\Hello {{ name}}
         \\You have just won ${{value }}!
         \\{{# in_ca  }}
         \\Well, ${{ taxed_value }}, after taxes.
         \\{{/  in_ca }}
-    ,
+        }},
         .{
             .greeting = "Welcome",
             .farewell = "Fair enough, right?",

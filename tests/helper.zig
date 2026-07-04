@@ -34,28 +34,6 @@ pub fn expectRenderComptime(
     try expectRendered(&t, data, expected);
 }
 
-/// `expectRender` with a single partial named "partial" (the mustache.js test
-/// harness renders every partial fixture with
-/// `Mustache.render(template, view, { partial: <contents> })`).
-pub fn expectRenderPartial(
-    comptime template: []const u8,
-    comptime partial: []const u8,
-    data: anytype,
-    expected: []const u8,
-) !void {
-    try expectRender(template, &.{.{ .name = "partial", .data = partial }}, data, expected);
-}
-
-/// `expectRenderPartial` through the comptime parser.
-pub fn expectRenderPartialComptime(
-    comptime template: []const u8,
-    comptime partial: []const u8,
-    data: anytype,
-    expected: []const u8,
-) !void {
-    try expectRenderComptime(template, &.{.{ .name = "partial", .data = partial }}, data, expected);
-}
-
 /// Uses `renderAlloc` directly (rather than `Mustache.build`) because it has
 /// no struct-only restriction: several spec cases use a bare string/int/array
 /// as the top-level data.

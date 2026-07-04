@@ -311,11 +311,15 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
                     const frame = &l.stack[l.index];
                     frame.open_sections += 1;
                     if (frame.open_sections >= NESTING_LIMIT) return error.TooDeep;
+                    // Section names resolve like `write_path`: pre-split and
+                    // pre-hashed at parse time.
+                    const segs = l.appendPathSegs(b, e);
                     try l.pushInstruction(.{
                         .op = if (sigil == '#') .section_start else .section_start_inv,
                         .name_pos = b,
                         .name_len = e - b,
-                        .offset = frame.data_pos - b,
+                        .offset = segs.start,
+                        .len = segs.count,
                     });
                 },
                 '>' => {
@@ -379,7 +383,6 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
                                     return error.ClosureMismatch;
                                 }
                                 insts[pos].end = @intCast(insts.len);
-                                insts[pos].len = tag_start - (insts[pos].name_pos + insts[pos].offset);
                                 try l.pushInstruction(.{
                                     .op = .section_end,
                                     .end = insts[pos].end,

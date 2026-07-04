@@ -378,9 +378,12 @@ test "recursive data through a recursive partial" {
     try std.testing.expectEqualStrings("a[b[d[]]c[]]", rendered);
 }
 
-test "non-UTF-8 byte slices iterate as arrays" {
-    try expectRender("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(255)(1)");
-    try expectRenderComptime("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(255)(1)");
+test "byte slices are strings regardless of UTF-8 validity" {
+    // No render-time validation: bytes pass through verbatim, and a
+    // non-empty sequence is truthy like any other string.
+    try expectRender("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(\xff\x01)");
+    try expectRenderComptime("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(\xff\x01)");
+    try expectRender("{{{b}}}", &.{}, .{ .b = "\xff\x01" }, "\xff\x01");
 }
 
 test "load errors" {

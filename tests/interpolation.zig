@@ -215,3 +215,29 @@ test "mustachejs: bom_as_whitespace" {
         "Tag name w&#x2F;o BOM",
     );
 }
+
+test "escaping: long strings through the vectorized scan" {
+    // Exercises the SIMD escape path in `writeString`: strings longer than a
+    // vector chunk, escapes falling inside chunks, on chunk boundaries, in
+    // the sub-vector tail, back-to-back, and none at all.
+    const clean = "a clean sentence that is comfortably longer than one simd chunk";
+    try expectRender("{{v}}", &.{}, .{ .v = clean }, clean);
+
+    // 64 bytes with escapes at positions 0, 15, 16, 31 and in the tail.
+    const spiky = "&23456789012345<>2345678901234\"56789012345678901234567890123'56";
+    const spiky_out = "&amp;23456789012345&lt;&gt;2345678901234&quot;56789012345678901234567890123&#39;56";
+    try expectRender("{{v}}", &.{}, .{ .v = spiky }, spiky_out);
+    try expectRenderComptime("{{v}}", &.{}, .{ .v = spiky }, spiky_out);
+
+    // Every byte escapes, spanning several chunks.
+    const dense: [34]u8 = @splat('&');
+    const dense_out = comptime blk: {
+        var s: []const u8 = "";
+        for (0..dense.len) |_| s = s ++ "&amp;";
+        break :blk s;
+    };
+    try expectRender("{{v}}", &.{}, .{ .v = &dense }, dense_out);
+
+    // Unescaped writes bypass the scan entirely.
+    try expectRender("{{{v}}}", &.{}, .{ .v = spiky }, spiky);
+}
