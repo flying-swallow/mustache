@@ -34,6 +34,17 @@ pub const Context = struct {
         /// Writes the value's text form (nothing for null and composites),
         /// HTML-escaping if requested.
         write: *const fn (*const anyopaque, *Writer, bool) Writer.Error!void,
+        /// Hot-path combination of `get` + `write`: resolves object key `key`
+        /// (with `hash == fieldHash(key)` pre-checked by the caller) and writes
+        /// its text directly, skipping the intermediate `Context`. Returns true
+        /// if the key was present (even a present-but-null value that writes
+        /// nothing), false if it is not a key of this object. Non-objects and
+        /// missing keys return false, mirroring `get`.
+        getWrite: *const fn (*const anyopaque, u32, []const u8, *Writer, bool) Writer.Error!bool,
+        /// Like `get`, but with a precomputed `hash == fieldHash(key)` so the
+        /// field scan rejects non-matches with a u32 compare before the byte
+        /// compare. Used by the renderer's precomputed dotted-path resolution.
+        getHash: *const fn (*const anyopaque, u32, []const u8) ?Context,
     };
 
     /// Identity for the renderer's repeated-context skip. The vtable pointer
@@ -53,6 +64,16 @@ pub const Context = struct {
 
     pub fn getKey(c: Context, key: []const u8) ?Context {
         return c.vtable.get(c.ptr, key);
+    }
+
+    /// Key lookup with a precomputed hash; see `VTable.getHash`.
+    pub fn getKeyHash(c: Context, hash: u32, key: []const u8) ?Context {
+        return c.vtable.getHash(c.ptr, hash, key);
+    }
+
+    /// Combined key lookup and write; see `VTable.getWrite`.
+    pub fn getKeyWrite(c: Context, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
+        return c.vtable.getWrite(c.ptr, hash, key, w, escape);
     }
 
     pub fn write(c: Context, w: *Writer, escape: bool) Writer.Error!void {
@@ -152,7 +173,96 @@ const null_vtable: Context.VTable = .{
     .write = struct {
         fn f(_: *const anyopaque, _: *Writer, _: bool) Writer.Error!void {}
     }.f,
+    .getWrite = struct {
+        fn f(_: *const anyopaque, _: u32, _: []const u8, _: *Writer, _: bool) Writer.Error!bool {
+            return false;
+        }
+    }.f,
+    .getHash = struct {
+        fn f(_: *const anyopaque, _: u32, _: []const u8) ?Context {
+            return null;
+        }
+    }.f,
 };
+
+/// Wyhash (truncated to 32-bit) over `name`. The interpolation fast path
+/// pre-hashes tag names at parse time (stored in `Instruction.offset`) and
+/// dispatches field lookup by comparing against `comptime fieldHash(field_name)`;
+/// both sides must agree, so they share this one function (Wyhash yields the
+/// same value at comptime and runtime). A hash match is always confirmed with a
+/// byte compare, so collisions are harmless.
+pub fn fieldHash(name: []const u8) u32 {
+    return @truncate(std.hash.Wyhash.hash(0, name));
+}
+
+/// Whether a struct field of type `F` can be written directly by `writeValue`
+/// without building a `Context` — i.e. it is a leaf that needs no optional /
+/// union / pointer-to-one unwrapping. Kept in lockstep with `writeValue` and
+/// the scalar prongs of `Impl.writeFn`.
+pub fn directlyWritable(comptime F: type) bool {
+    return switch (@typeInfo(F)) {
+        .array => |a| a.child == u8,
+        .pointer => |p| p.size == .slice and p.child == u8,
+        .int, .float, .bool, .@"enum", .error_set => true,
+        else => false,
+    };
+}
+
+/// Monomorphic counterpart to `Context.init(ptr).write(...)` for the leaf
+/// types `directlyWritable` admits: writes a struct field of comptime-known
+/// type `F` with no vtable dispatch and no intermediate `Context`. Behaviour
+/// must match the corresponding prong of `Impl.writeFn`.
+pub fn writeValue(comptime F: type, ptr: *const F, w: *Writer, escape: bool) Writer.Error!void {
+    switch (@typeInfo(F)) {
+        .array => try byteWrite(ptr, w, escape), // child == u8
+        .pointer => try byteWrite(ptr.*, w, escape), // slice, child == u8
+        .int => try w.print("{d}", .{ptr.*}),
+        .float => try w.print("{d}", .{ptr.*}),
+        .bool => try w.writeAll(if (ptr.*) "true" else "false"),
+        .@"enum" => try w.print("{d}", .{@intFromEnum(ptr.*)}),
+        .error_set => try writeString(w, @errorName(ptr.*), escape),
+        else => comptime unreachable,
+    }
+}
+
+/// Shared struct field-scan + write, used by both the type-erased
+/// `Impl.getWriteFn` vtable entry and the monomorphic static renderer
+/// (`render.zig`). Finds the field of `T` whose name hashes to `hash`
+/// (confirmed by a byte compare, so collisions are harmless) and writes it:
+/// leaf fields go straight through `writeValue` (no `Context`, no second
+/// dispatch); optionals / unions / pointers-to-one / nested objects / packed
+/// and comptime fields fall back to the general `get` + `write` path so
+/// behaviour is identical to `getKey(...).?.write(...)`. Returns true iff `key`
+/// names a field of `T` (even a present-but-null one that writes nothing).
+pub fn writeField(comptime T: type, ptr: *const T, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            if (comptime info.is_tuple) return false;
+            inline for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
+                if (comptime F != void) {
+                    if (hash == (comptime fieldHash(name))) {
+                        if (comptime !attrs.@"comptime" and info.layout != .@"packed" and directlyWritable(F)) {
+                            try writeValue(F, &@field(ptr.*, name), w, escape);
+                        } else {
+                            // getFn matches the same field, so `.?` holds.
+                            try Impl(T).getFn(@ptrCast(ptr), key).?.write(w, escape);
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// A u8 sequence is a string when it is valid UTF-8 and an array of bytes
+/// otherwise, decided at render time; only the string form has a text value.
+fn byteWrite(s: []const u8, w: *Writer, escape: bool) Writer.Error!void {
+    if (!std.unicode.utf8ValidateSlice(s)) return;
+    try writeString(w, s, escape);
+}
 
 /// Generates the vtable for a concrete (already-unwrapped) type `T`.
 fn Impl(comptime T: type) type {
@@ -162,6 +272,8 @@ fn Impl(comptime T: type) type {
             .element = elementFn,
             .get = getFn,
             .write = writeFn,
+            .getWrite = getWriteFn,
+            .getHash = getHashFn,
         };
 
         fn self(ptr: *const anyopaque) *const T {
@@ -267,6 +379,45 @@ fn Impl(comptime T: type) type {
             }
         }
 
+        /// `getFn` with a precomputed `hash == fieldHash(key)` pre-check, so a
+        /// non-matching field is rejected by a u32 compare before the byte
+        /// compare. Behaviour is otherwise identical to `getFn`.
+        fn getHashFn(ptr: *const anyopaque, hash: u32, key: []const u8) ?Context {
+            switch (@typeInfo(T)) {
+                .@"struct" => |info| {
+                    if (comptime info.is_tuple) return null;
+                    inline for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
+                        if (comptime F != void) {
+                            if (hash == (comptime fieldHash(name)) and std.mem.eql(u8, key, name)) {
+                                if (comptime attrs.@"comptime") {
+                                    if (comptime F == @TypeOf(null)) return null_context;
+                                    return comptimeValue(attrs.defaultValue(F).?);
+                                } else if (comptime info.layout == .@"packed") {
+                                    const load = struct {
+                                        fn f(p: *const T) F {
+                                            return @field(p.*, name);
+                                        }
+                                    }.f;
+                                    return .{ .ptr = ptr, .vtable = &ByValue(T, F, load).vtable };
+                                } else {
+                                    return Context.init(&@field(self(ptr).*, name));
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+
+        /// Hot-path field lookup + write; the shared `writeField` does the work
+        /// (also called directly, without this vtable hop, by the static
+        /// renderer in `render.zig`).
+        fn getWriteFn(ptr: *const anyopaque, hash: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
+            return writeField(T, self(ptr), hash, key, w, escape);
+        }
+
         fn writeFn(ptr: *const anyopaque, w: *Writer, escape: bool) Writer.Error!void {
             switch (@typeInfo(T)) {
                 // Composite values have no text form (the C version
@@ -305,11 +456,6 @@ fn Impl(comptime T: type) type {
             if (std.unicode.utf8ValidateSlice(s)) return selfContext(ptr);
             return if (i < s.len) Context.init(&s[i]) else null;
         }
-
-        fn byteWrite(s: []const u8, w: *Writer, escape: bool) Writer.Error!void {
-            if (!std.unicode.utf8ValidateSlice(s)) return;
-            try writeString(w, s, escape);
-        }
     };
 }
 
@@ -324,10 +470,28 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
             .element = elementFn,
             .get = getFn,
             .write = writeFn,
+            .getWrite = getWriteFn,
+            .getHash = getHashFn,
         };
 
         fn self(ptr: *const anyopaque) *const Parent {
             return @ptrCast(@alignCast(ptr));
+        }
+
+        /// Packed / by-value fields are never the render hot path, so this just
+        /// defers to the general `getFn` + `write`.
+        fn getWriteFn(ptr: *const anyopaque, _: u32, key: []const u8, w: *Writer, escape: bool) Writer.Error!bool {
+            if (getFn(ptr, key)) |c| {
+                try c.write(w, escape);
+                return true;
+            }
+            return false;
+        }
+
+        /// Packed / by-value fields are never the render hot path; defer to the
+        /// string-based `getFn`.
+        fn getHashFn(ptr: *const anyopaque, _: u32, key: []const u8) ?Context {
+            return getFn(ptr, key);
         }
 
         fn countFn(ptr: *const anyopaque) usize {
@@ -371,33 +535,41 @@ fn ByValue(comptime Parent: type, comptime F: type, comptime load: fn (*const Pa
 
 fn writeString(w: *Writer, s: []const u8, escape: bool) Writer.Error!void {
     if (!escape) return w.writeAll(s);
-    for (s) |c| try w.writeAll(html_escape_table[c]);
+    // Copy runs of non-escaped bytes in bulk, emitting an entity only at each
+    // byte that needs escaping. The scan reads a single byte per input byte
+    // from a compact 256-byte flag table (cache-friendlier than a table of
+    // slices) and only maps the byte to its entity on the rare escape hit.
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        if (html_escape_flags[c]) {
+            if (i > start) try w.writeAll(s[start..i]);
+            try w.writeAll(htmlEntity(c));
+            start = i + 1;
+        }
+    }
+    if (start < s.len) try w.writeAll(s[start..]);
 }
 
-/// The exact escape table of mustache.js's `entityMap`: the HTML
-/// metacharacters plus backtick, '=' and '/' are replaced, everything else
-/// passes through.
-const html_escape_table: [256][]const u8 = blk: {
-    @setEvalBranchQuota(10_000);
-    var table: [256][]const u8 = undefined;
-    for (0..256) |i| {
-        table[i] = switch (i) {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&#39;",
-            '`' => "&#x60;",
-            '=' => "&#x3D;",
-            '/' => "&#x2F;",
-            else => single(i),
-        };
-    }
+/// mustache.js's `entityMap` keys: the HTML metacharacters plus backtick, '='
+/// and '/'. `html_escape_flags[c]` is true iff byte `c` must be escaped.
+const html_escape_flags: [256]bool = blk: {
+    var table: [256]bool = @splat(false);
+    for ("&<>\"'`=/") |c| table[c] = true;
     break :blk table;
 };
 
-fn single(comptime i: usize) []const u8 {
-    const c = [1]u8{@intCast(i)};
-    const copy = c;
-    return &copy;
+/// The replacement entity for an escaped byte; only called on bytes for which
+/// `html_escape_flags` is set.
+fn htmlEntity(c: u8) []const u8 {
+    return switch (c) {
+        '&' => "&amp;",
+        '<' => "&lt;",
+        '>' => "&gt;",
+        '"' => "&quot;",
+        '\'' => "&#39;",
+        '`' => "&#x60;",
+        '=' => "&#x3D;",
+        '/' => "&#x2F;",
+        else => unreachable,
+    };
 }

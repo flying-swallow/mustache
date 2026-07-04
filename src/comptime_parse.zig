@@ -11,11 +11,13 @@
 
 const std = @import("std");
 const parser = @import("parser.zig");
+const context = @import("context.zig");
 
 const Op = parser.Op;
 const Instruction = parser.Instruction;
 const Template = parser.Template;
 const Segment = parser.Segment;
+const PathSeg = parser.PathSeg;
 const Frame = parser.Frame;
 const Partial = parser.Partial;
 const NESTING_LIMIT = parser.NESTING_LIMIT;
@@ -38,6 +40,9 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
         data_len: u32 = 0,
         segs: [seg_cap]Segment = undefined,
         seg_len: u32 = 0,
+        // Every path segment is >= 1 byte, so segment count <= byte count.
+        path_segs: [data_cap]PathSeg = @splat(.{ .hash = 0, .pos = 0, .len = 0 }),
+        path_seg_len: u32 = 0,
         stack: [NESTING_LIMIT]Frame = undefined,
         /// Top of `stack`; 0 means empty (frame 0 is never used).
         index: u16 = 0,
@@ -66,6 +71,35 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
                 @compileError("mustache comptime: segment buffer overflow (report this template)");
             l.segs[l.seg_len] = seg;
             l.seg_len += 1;
+        }
+
+        /// Splits the name `bytes[b..e]` on '.' and appends a pre-hashed
+        /// `PathSeg` per segment; returns the (start, count) run for the
+        /// `write_path` instruction. Mirrors `Loader.appendPathSegs`.
+        fn appendPathSegs(l: *Self, b: u32, e: u32) struct { start: u32, count: u32 } {
+            const start: u32 = l.path_seg_len;
+            const name = l.bytes[b..e];
+            if (name.len == 0 or (name.len == 1 and name[0] == '.'))
+                return .{ .start = start, .count = 0 };
+            var seg_pos: u32 = b;
+            var rest: []const u8 = name;
+            while (true) {
+                const dot = std.mem.indexOfScalar(u8, rest, '.');
+                const seg_len: u32 = if (dot) |d| @intCast(d) else @intCast(rest.len);
+                if (l.path_seg_len >= data_cap)
+                    @compileError("mustache comptime: path segment buffer overflow (report this template)");
+                l.path_segs[l.path_seg_len] = .{
+                    .hash = context.fieldHash(rest[0..seg_len]),
+                    .pos = seg_pos,
+                    .len = seg_len,
+                };
+                l.path_seg_len += 1;
+                if (dot) |d| {
+                    rest = rest[d + 1 ..];
+                    seg_pos += seg_len + 1;
+                } else break;
+            }
+            return .{ .start = start, .count = l.path_seg_len - start };
         }
 
         /// Emits text as `write_text` instructions, splitting at newlines and
@@ -237,8 +271,8 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
             }
 
             if (beg == end) {
-                // Empty tag; emit an (unresolvable) empty-named argument.
-                try l.pushInstruction(.{ .op = .write_arg, .name_pos = beg, .name_len = 0 });
+                // Empty tag; emit an (unresolvable) empty-named path (0 segments).
+                try l.pushInstruction(.{ .op = .write_path, .name_pos = beg, .name_len = 0 });
                 return;
             }
 
@@ -386,11 +420,29 @@ fn ComptimeLoader(comptime inst_cap: usize, comptime data_cap: usize, comptime s
                         e -= 1;
                         trim(data, &b, &e);
                     }
-                    try l.pushInstruction(.{
-                        .op = if (escaped) .write_arg else .write_arg_unescaped,
-                        .name_pos = b,
-                        .name_len = e - b,
-                    });
+                    // Classify once, at parse time, so the render hot path never
+                    // scans for '.': a non-empty name with no dot is a simple key
+                    // (fast field lookup by hash); everything else — dotted, the
+                    // implicit `{{.}}`, and empty tags — is a `write_path`.
+                    if (e > b and std.mem.indexOfScalar(u8, data[b..e], '.') == null) {
+                        try l.pushInstruction(.{
+                            .op = if (escaped) .write_arg else .write_arg_unescaped,
+                            .name_pos = b,
+                            .name_len = e - b,
+                            // `offset` is unused by simple-key instructions; carry
+                            // the tag name's hash for the renderer's fast lookup.
+                            .offset = context.fieldHash(data[b..e]),
+                        });
+                    } else {
+                        const segs = l.appendPathSegs(b, e);
+                        try l.pushInstruction(.{
+                            .op = if (escaped) .write_path else .write_path_unescaped,
+                            .name_pos = b,
+                            .name_len = e - b,
+                            .offset = segs.start,
+                            .len = segs.count,
+                        });
+                    }
                 },
             }
         }
@@ -450,7 +502,14 @@ pub fn parse(
             var l: ComptimeLoader(inst_cap, data_cap, seg_cap) = .{ .partials = partials };
             l.loadData(filename, data) catch |e| @compileError("mustache comptime load: " ++ @errorName(e));
             l.parse() catch |e| @compileError("mustache comptime parse: " ++ @errorName(e));
-            break :blk .{ .insts = l.insts, .il = l.inst_len, .bytes = l.bytes, .dl = l.data_len };
+            break :blk .{
+                .insts = l.insts,
+                .il = l.inst_len,
+                .bytes = l.bytes,
+                .dl = l.data_len,
+                .path_segs = l.path_segs,
+                .psl = l.path_seg_len,
+            };
         };
         const insts = blk: {
             var t: [raw.il]Instruction = undefined;
@@ -462,6 +521,16 @@ pub fn parse(
             for (0..raw.dl) |i| t[i] = raw.bytes[i];
             break :blk t;
         };
+        const path_segs = blk: {
+            var t: [raw.psl]PathSeg = undefined;
+            for (0..raw.psl) |i| t[i] = raw.path_segs[i];
+            break :blk t;
+        };
     };
-    return .{ .instructions = &S.insts, .data = &S.bytes };
+    return .{
+        .instructions = &S.insts,
+        .data = &S.bytes,
+        .path_segs = &S.path_segs,
+        .size_hint = parser.sizeHint(&S.insts),
+    };
 }

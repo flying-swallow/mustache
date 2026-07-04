@@ -36,72 +36,306 @@ const RenderFrame = struct {
 /// and jump (reused partials), so this is a small VM with an explicit frame
 /// stack rather than recursion.
 pub fn render(template: *const Template, data: anytype, out: *std.Io.Writer) Error!void {
-    const root: Context = if (comptime context.isComptimeOnly(@TypeOf(data)))
-        comptime context.comptimeValue(data)
-    else
-        Context.init(&data);
-
-    const insts = template.instructions;
-    const bytes = template.data;
     var r: Renderer = .{
-        .insts = insts,
-        .data = bytes,
+        .insts = template.instructions,
+        .data = template.data,
+        .path_segs = template.path_segs,
         .out = out,
     };
-    r.frames[0] = .{
-        .context = root,
-        .section = null,
-        .start = 0,
-        .end = insts[0].end,
-        .idx = 0,
-        .count = 0,
-    };
-
-    var pos: u32 = 0;
-    while (pos < insts.len) : (pos += 1) {
-        const inst = insts[pos];
-        switch (inst.op) {
-            .write_text => try out.writeAll(bytes[inst.name_pos..][0..inst.name_len]),
-            .write_arg => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], true),
-            .write_arg_unescaped => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], false),
-            .section_goto, .section_start, .section_start_inv => {
-                if (r.index + 1 >= parser.NESTING_LIMIT) return error.TooDeep;
-                r.index += 1;
-                const frame = &r.frames[r.index];
-                frame.* = .{
-                    .context = r.frames[r.index - 1].context,
-                    .section = null,
-                    .start = if (inst.op == .section_goto) inst.len else pos,
-                    .end = inst.end,
-                    .idx = 0,
-                    .count = 1,
-                };
-                if (inst.name_pos != parser.NO_NAME) {
-                    const name = bytes[inst.name_pos..][0..inst.name_len];
-                    frame.section = r.findValue(name);
-                    // Truthiness matches mustache.js: '', 0 and NaN are falsy.
-                    var count: usize = if (frame.section) |v| v.count() else 0;
-                    if (inst.op == .section_start_inv) count = @intFromBool(count == 0);
-                    frame.count = count;
-                }
-                pos = r.sectionEnd();
-            },
-            .section_end => pos = r.sectionEnd(),
-            .padding_push => r.padding = pos,
-            .padding_pop => r.padding = insts[r.padding].end,
-            .padding_write => try r.writePadding(),
-        }
+    const len: u32 = @intCast(template.instructions.len);
+    const T = @TypeOf(data);
+    if (comptime staticEligible(T)) {
+        // Monomorphic fast path: dispatch field writes directly against the
+        // concrete root type, no `Context` vtable. `Parents` starts empty.
+        try r.renderStatic(T, &data, @TypeOf(.{}), .{}, 0, len, 0);
+    } else {
+        const root: Context = if (comptime context.isComptimeOnly(T))
+            comptime context.comptimeValue(data)
+        else
+            Context.init(&data);
+        try r.renderErased(&.{root}, 0, len, false);
     }
+}
+
+/// Comptime eligibility for the monomorphic static render path: the root value
+/// must be a concrete (non-tuple) struct we can scan field-by-field. Everything
+/// else (bare strings/ints/arrays, comptime-only roots, tuples) renders through
+/// the type-erased VM.
+fn staticEligible(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| !info.is_tuple,
+        else => false,
+    };
 }
 
 const Renderer = struct {
     insts: []const Instruction,
     data: []const u8,
+    path_segs: []const parser.PathSeg,
     out: *std.Io.Writer,
     frames: [parser.NESTING_LIMIT]RenderFrame = undefined,
     index: usize = 0,
     /// Instruction index of the active `padding_push` (0 = none).
     padding: u32 = 0,
+
+    /// The type-erased instruction VM. Renders instructions `[start, end)`
+    /// with the frame stack seeded from `seeds` (root context first, current
+    /// context last), so a field miss walks up through every seeded ancestor.
+    /// This is the correctness baseline; the monomorphic static renderer falls
+    /// back here for anything it does not specialize.
+    fn renderErased(r: *Renderer, seeds: []const Context, start: u32, end: u32, stop_at_base: bool) Error!void {
+        const insts = r.insts;
+        const bytes = r.data;
+        for (seeds, 0..) |seed, i| {
+            r.frames[i] = .{
+                .context = seed,
+                .section = null,
+                .start = start,
+                .end = end,
+                .idx = 0,
+                .count = 0,
+            };
+        }
+        // The seeded base level. When rendering a single fallen-back section
+        // (`stop_at_base`, `start` at its `section_start`, `end` the full
+        // instruction count), execution completes when the frame stack pops
+        // back to `base` — a `section_goto` (recursive partial) can roam past
+        // the section's own end, so completion is tracked by frame level, not
+        // `pos`.
+        const base = seeds.len - 1;
+        r.index = base;
+
+        var pos: u32 = start;
+        while (pos < end) : (pos += 1) {
+            const inst = insts[pos];
+            switch (inst.op) {
+                .write_text => try r.out.writeAll(bytes[inst.name_pos..][0..inst.name_len]),
+                .write_arg => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], inst.offset, true),
+                .write_arg_unescaped => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], inst.offset, false),
+                .write_path => if (r.findValuePath(inst)) |v| try v.write(r.out, true),
+                .write_path_unescaped => if (r.findValuePath(inst)) |v| try v.write(r.out, false),
+                .section_goto, .section_start, .section_start_inv => {
+                    if (r.index + 1 >= parser.NESTING_LIMIT) return error.TooDeep;
+                    r.index += 1;
+                    const frame = &r.frames[r.index];
+                    frame.* = .{
+                        .context = r.frames[r.index - 1].context,
+                        .section = null,
+                        .start = if (inst.op == .section_goto) inst.len else pos,
+                        .end = inst.end,
+                        .idx = 0,
+                        .count = 1,
+                    };
+                    if (inst.name_pos != parser.NO_NAME) {
+                        const name = bytes[inst.name_pos..][0..inst.name_len];
+                        frame.section = r.findValue(name);
+                        // Truthiness matches mustache.js: '', 0 and NaN are falsy.
+                        var count: usize = if (frame.section) |v| v.count() else 0;
+                        if (inst.op == .section_start_inv) count = @intFromBool(count == 0);
+                        frame.count = count;
+                    }
+                    pos = r.sectionEnd();
+                    if (stop_at_base and r.index == base) return;
+                },
+                .section_end => {
+                    pos = r.sectionEnd();
+                    if (stop_at_base and r.index == base) return;
+                },
+                .padding_push => r.padding = pos,
+                .padding_pop => r.padding = insts[r.padding].end,
+                .padding_write => try r.writePadding(),
+            }
+        }
+    }
+
+    /// Monomorphic render of instructions `[start, end)` against a
+    /// comptime-known context type `Ctx`. Field writes and same-context
+    /// wrappers / partial jumps dispatch statically (no vtable); anything not
+    /// yet specialized — named data sections, dotted / implicit names — falls
+    /// back to `renderErased`. `Parents` is a tuple of typed ancestor pointers
+    /// (root first, immediate parent last); a field missing from `Ctx` is
+    /// resolved there.
+    fn renderStatic(
+        r: *Renderer,
+        comptime Ctx: type,
+        ctx: *const Ctx,
+        comptime Parents: type,
+        parents: Parents,
+        start: u32,
+        end: u32,
+        depth: u16,
+    ) Error!void {
+        if (depth >= parser.NESTING_LIMIT) return error.TooDeep;
+        const insts = r.insts;
+        const bytes = r.data;
+        var pos: u32 = start;
+        while (pos < end) : (pos += 1) {
+            const inst = insts[pos];
+            switch (inst.op) {
+                .write_text => try r.out.writeAll(bytes[inst.name_pos..][0..inst.name_len]),
+                .write_arg => try r.renderField(Ctx, ctx, Parents, parents, inst.offset, bytes[inst.name_pos..][0..inst.name_len], true),
+                .write_arg_unescaped => try r.renderField(Ctx, ctx, Parents, parents, inst.offset, bytes[inst.name_pos..][0..inst.name_len], false),
+                .write_path => try r.renderPath(Ctx, ctx, Parents, parents, inst, true),
+                .write_path_unescaped => try r.renderPath(Ctx, ctx, Parents, parents, inst, false),
+                .section_goto => {
+                    // Partial include: jump to the reused range's body, same
+                    // context. `inst.len` is the target's (unnamed)
+                    // `section_start`; execution resumes after this goto.
+                    const target = inst.len;
+                    try r.renderStatic(Ctx, ctx, Parents, parents, target + 1, insts[target].end, depth + 1);
+                },
+                .section_start, .section_start_inv => {
+                    if (inst.name_pos == parser.NO_NAME) {
+                        // Unnamed wrapper (template / partial body): same
+                        // context, runs exactly once.
+                        try r.renderStatic(Ctx, ctx, Parents, parents, pos + 1, inst.end, depth + 1);
+                    } else {
+                        // Named data section: not specialized yet -> VM.
+                        try r.fallbackSection(Ctx, ctx, Parents, parents, pos);
+                    }
+                    pos = inst.end;
+                },
+                .section_end => {},
+                .padding_push => r.padding = pos,
+                .padding_pop => r.padding = insts[r.padding].end,
+                .padding_write => try r.writePadding(),
+            }
+        }
+    }
+
+    /// Resolves a simple key `name` (classified at parse time — never dotted,
+    /// implicit or empty) against `Ctx`, then the `Parents` chain nearest first,
+    /// and writes it through direct `context.writeField` calls — no vtable.
+    fn renderField(
+        r: *Renderer,
+        comptime Ctx: type,
+        ctx: *const Ctx,
+        comptime Parents: type,
+        parents: Parents,
+        hash: u32,
+        name: []const u8,
+        escape: bool,
+    ) std.Io.Writer.Error!void {
+        if (try context.writeField(Ctx, ctx, hash, name, r.out, escape)) return;
+        comptime var k = @typeInfo(Parents).@"struct".field_types.len;
+        inline while (k > 0) {
+            k -= 1;
+            const p = parents[k];
+            if (try context.writeField(@TypeOf(p.*), p, hash, name, r.out, escape)) return;
+        }
+        // Total miss: mustache renders nothing.
+    }
+
+    /// Static handler for a `write_path` instruction. `count == 0` is the
+    /// implicit iterator `{{.}}` (writes the current context, which for a struct
+    /// is nothing) or an empty tag (nothing); otherwise it dispatches the
+    /// precomputed segments through the recursive `writePath`.
+    fn renderPath(
+        r: *Renderer,
+        comptime Ctx: type,
+        ctx: *const Ctx,
+        comptime Parents: type,
+        parents: Parents,
+        inst: Instruction,
+        escape: bool,
+    ) std.Io.Writer.Error!void {
+        const count = inst.len;
+        if (count == 0) {
+            if (inst.name_len == 1) try Context.init(ctx).write(r.out, escape); // `{{.}}`
+            return;
+        }
+        const segs = r.path_segs[inst.offset..][0..count];
+        _ = try r.writePath(Ctx, ctx, Parents, parents, segs, 0, escape);
+    }
+
+    /// Resolves `segs[seg_index..]` against `Ctx` by precomputed hash — no
+    /// '.'-scan, no string search beyond the collision-confirming compare —
+    /// descending statically into concrete struct fields. Returns true once a
+    /// context containing the head segment is found (the chain then commits: a
+    /// broken tail writes nothing but does NOT fall back to `Parents`). The head
+    /// segment (`seg_index == 0`) also walks the `Parents` chain nearest-first.
+    fn writePath(
+        r: *Renderer,
+        comptime Ctx: type,
+        ctx: *const Ctx,
+        comptime Parents: type,
+        parents: Parents,
+        segs: []const parser.PathSeg,
+        seg_index: usize,
+        escape: bool,
+    ) std.Io.Writer.Error!bool {
+        const seg = segs[seg_index];
+        const name = r.data[seg.pos..][0..seg.len];
+        const last = seg_index + 1 == segs.len;
+
+        if (comptime staticEligible(Ctx)) {
+            const s = @typeInfo(Ctx).@"struct";
+            inline for (s.field_names, s.field_types, s.field_attrs) |fname, F, attrs| {
+                if (comptime F != void) {
+                    if (seg.hash == (comptime context.fieldHash(fname)) and std.mem.eql(u8, name, fname)) {
+                        if (last) {
+                            // Leaf/field write reuses `writeField`'s exact logic.
+                            _ = try context.writeField(Ctx, ctx, seg.hash, name, r.out, escape);
+                        } else if (comptime !attrs.@"comptime" and s.layout != .@"packed" and staticEligible(F)) {
+                            // Descend statically into a concrete struct field.
+                            _ = try r.writePath(F, &@field(ctx.*, fname), @TypeOf(.{}), .{}, segs, seg_index + 1, escape);
+                        } else {
+                            // Optional / union / pointer / slice / packed /
+                            // comptime field: resolve to a Context and finish the
+                            // tail through the type-erased path.
+                            if (Context.init(ctx).getKeyHash(seg.hash, name)) |fc|
+                                _ = try r.writePathErasedTail(fc, segs, seg_index + 1, escape);
+                        }
+                        return true; // head matched -> committed
+                    }
+                }
+            }
+        }
+
+        // Not found in `Ctx`. Only the head segment falls back to parents.
+        if (seg_index == 0) {
+            comptime var k = @typeInfo(Parents).@"struct".field_types.len;
+            inline while (k > 0) {
+                k -= 1;
+                const p = parents[k];
+                if (try r.writePath(@TypeOf(p.*), p, @TypeOf(.{}), .{}, segs, 0, escape)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Finishes a dotted tail against an already-resolved `Context` (used when a
+    /// segment lands on an optional/union/pointer/slice/packed/comptime field
+    /// the static path cannot descend into). Strict per segment.
+    fn writePathErasedTail(r: *Renderer, start: Context, segs: []const parser.PathSeg, seg_index: usize, escape: bool) std.Io.Writer.Error!bool {
+        var current = start;
+        for (segs[seg_index..]) |seg| {
+            current = current.getKeyHash(seg.hash, r.data[seg.pos..][0..seg.len]) orelse return false;
+        }
+        try current.write(r.out, escape);
+        return true;
+    }
+
+    /// Hands a named section (and its body) at instruction `pos` to the
+    /// type-erased VM, seeding the frame stack with the static ancestor chain
+    /// (root first) so scope-walk still reaches statically-rendered ancestors.
+    fn fallbackSection(
+        r: *Renderer,
+        comptime Ctx: type,
+        ctx: *const Ctx,
+        comptime Parents: type,
+        parents: Parents,
+        pos: u32,
+    ) Error!void {
+        const np = @typeInfo(Parents).@"struct".field_types.len;
+        var seeds: [np + 1]Context = undefined;
+        inline for (0..np) |i| seeds[i] = Context.init(parents[i]);
+        seeds[np] = Context.init(ctx);
+        // Full instruction bound + stop-at-base: a recursive partial's goto may
+        // jump beyond this section's own end, so completion is tracked by frame
+        // level, not `pos`.
+        try r.renderErased(&seeds, pos, @intCast(r.insts.len), true);
+    }
 
     /// Shared continuation of the section instructions: either (re-)enters
     /// the section body or jumps past its end. Returns the new instruction
@@ -171,12 +405,63 @@ const Renderer = struct {
         }
     }
 
-    /// Resolves an argument and writes its value as text. Padding (partial
-    /// indentation) is never injected here: per the mustache spec,
-    /// indentation applies to the partial's own lines, not to lines inside
-    /// interpolated values.
-    fn writeArg(r: *Renderer, name: []const u8, escape: bool) std.Io.Writer.Error!void {
-        const v = r.findValue(name) orelse return;
-        try v.write(r.out, escape);
+    /// Resolves a simple key `name` (classified at parse time — never the
+    /// implicit `{{.}}`, dotted or empty) and writes its value as text. Walks
+    /// the scope chain like `lookupTree`, but resolves and writes in a single
+    /// vtable call per frame, skipping the intermediate Context and the second
+    /// (write) dispatch. `hash` is `fieldHash(name)`, precomputed at parse time.
+    /// Padding (partial indentation) is never injected here: per the mustache
+    /// spec, indentation applies to the partial's own lines, not to lines
+    /// inside interpolated values.
+    fn writeArg(r: *Renderer, name: []const u8, hash: u32, escape: bool) std.Io.Writer.Error!void {
+        var i = r.index;
+        var previous: ?Context = null;
+        while (true) : (i -= 1) {
+            const ctx = r.frames[i].context;
+            const repeated = if (previous) |p| ctx.eql(p) else false;
+            if (!repeated) {
+                if (try ctx.getKeyWrite(hash, name, r.out, escape)) return;
+                previous = ctx;
+            }
+            if (i == 0) return;
+        }
+    }
+
+    /// Resolves a `write_path` instruction (dotted / implicit / empty) using
+    /// the precomputed, pre-hashed segments in `path_segs` — no '.'-scan, no
+    /// re-hash. `inst.offset`/`inst.len` bound the segment run; `count == 0` is
+    /// the implicit iterator `{{.}}` (`name_len == 1`) or an empty tag
+    /// (`name_len == 0`). The head segment scope-walks the frame stack; the tail
+    /// segments are strict lookups on the resolved object.
+    fn findValuePath(r: *const Renderer, inst: Instruction) ?Context {
+        const count = inst.len;
+        if (count == 0) {
+            if (inst.name_len == 1) return r.frames[r.index].context; // `{{.}}`
+            return null; // empty tag
+        }
+        const segs = r.path_segs[inst.offset..][0..count];
+        var current = r.lookupTreeHash(segs[0]) orelse return null;
+        for (segs[1..]) |seg| {
+            current = current.getKeyHash(seg.hash, r.data[seg.pos..][0..seg.len]) orelse return null;
+        }
+        return current;
+    }
+
+    /// Hash-based counterpart to `lookupTree`: searches the frame stack from the
+    /// current section towards the root (skipping repeated contexts) for an
+    /// object containing the segment.
+    fn lookupTreeHash(r: *const Renderer, seg: parser.PathSeg) ?Context {
+        const name = r.data[seg.pos..][0..seg.len];
+        var i = r.index;
+        var previous: ?Context = null;
+        while (true) : (i -= 1) {
+            const ctx = r.frames[i].context;
+            const repeated = if (previous) |p| ctx.eql(p) else false;
+            if (!repeated) {
+                if (ctx.getKeyHash(seg.hash, name)) |v| return v;
+                previous = ctx;
+            }
+            if (i == 0) return null;
+        }
     }
 };

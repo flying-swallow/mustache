@@ -108,7 +108,7 @@ pub fn renderAlloc(
     template: *const parser.Template,
     data: anytype,
 ) RenderAllocError![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(allocator, template.size_hint);
     defer aw.deinit();
     render_mod.render(template, data, &aw.writer) catch |err| switch (err) {
         error.TooDeep => return error.TooDeep,

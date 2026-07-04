@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const context = @import("context.zig");
 
 /// Maximum template/section nesting depth (same limit as the C parser).
 pub const NESTING_LIMIT = 82;
@@ -25,6 +26,12 @@ pub const Op = enum(u8) {
     write_text,
     write_arg,
     write_arg_unescaped,
+    /// A dotted (`a.b.c`), implicit (`{{.}}`) or empty tag. Its segments are
+    /// pre-split and pre-hashed at parse time: `offset` is the start index into
+    /// `Template.path_segs`, `len` the segment count (0 = implicit/empty, told
+    /// apart by `name_len`). `name_pos`/`name_len` keep the full original name.
+    write_path,
+    write_path_unescaped,
     section_start,
     section_start_inv,
     section_end,
@@ -47,7 +54,21 @@ pub const Instruction = struct {
     /// Length of the name / text / padding bytes.
     name_len: u32 = 0,
     /// Sections: distance from the name start to the section body start.
+    /// `write_arg` / `write_arg_unescaped`: `context.fieldHash` of the tag
+    /// name, for the renderer's fast field lookup.
     offset: u32 = 0,
+};
+
+/// One dotted-name segment, pre-split and pre-hashed at parse time. A
+/// `write_path` instruction references a contiguous run of these via
+/// `offset` (start index) and `len` (count).
+pub const PathSeg = struct {
+    /// `context.fieldHash` of the segment bytes.
+    hash: u32,
+    /// Offset into `Template.data` of the segment bytes.
+    pos: u32,
+    /// Length of the segment bytes.
+    len: u32,
 };
 
 /// A compiled template: an instruction array plus the concatenated text of
@@ -55,13 +76,30 @@ pub const Instruction = struct {
 pub const Template = struct {
     instructions: []const Instruction,
     data: []const u8,
+    /// Pre-split, pre-hashed segments of every dotted `write_path` name.
+    path_segs: []const PathSeg,
+    /// Sum of `write_text` byte lengths — a base output-size hint used to
+    /// pre-reserve render buffers. Approximate: it excludes interpolated
+    /// values and counts each section body only once.
+    size_hint: u32,
 
     pub fn deinit(self: *Template, allocator: Allocator) void {
         allocator.free(self.instructions);
         allocator.free(self.data);
+        allocator.free(self.path_segs);
         self.* = undefined;
     }
 };
+
+/// Sums the byte lengths of all `write_text` instructions, giving a base
+/// output-size estimate for a single render pass. Callable at comptime.
+pub fn sizeHint(instructions: []const Instruction) u32 {
+    var total: u32 = 0;
+    for (instructions) |inst| {
+        if (inst.op == .write_text) total +|= inst.name_len;
+    }
+    return total;
+}
 
 /// A named in-memory partial template, looked up before the filesystem.
 pub const Partial = struct {
@@ -106,6 +144,7 @@ pub fn load(
         loader.instructions.deinit(gpa);
         loader.data.deinit(gpa);
         loader.segments.deinit(gpa);
+        loader.path_segs.deinit(gpa);
     }
 
     if (data) |d| {
@@ -118,9 +157,13 @@ pub fn load(
 
     const instructions = try loader.instructions.toOwnedSlice(gpa);
     errdefer gpa.free(instructions);
+    const path_segs = try loader.path_segs.toOwnedSlice(gpa);
+    errdefer gpa.free(path_segs);
     return .{
         .instructions = instructions,
         .data = try loader.data.toOwnedSlice(gpa),
+        .path_segs = path_segs,
+        .size_hint = sizeHint(instructions),
     };
 }
 
@@ -161,6 +204,7 @@ const Loader = struct {
     instructions: std.ArrayList(Instruction) = .empty,
     data: std.ArrayList(u8) = .empty,
     segments: std.ArrayList(Segment) = .empty,
+    path_segs: std.ArrayList(PathSeg) = .empty,
     stack: [NESTING_LIMIT]Frame = undefined,
     /// Top of `stack`; 0 means empty (frame 0 is never used).
     index: u16 = 0,
@@ -171,6 +215,33 @@ const Loader = struct {
     fn pushInstruction(l: *Loader, inst: Instruction) LoadError!void {
         if (l.instructions.items.len >= std.math.maxInt(i32)) return error.TooDeep;
         try l.instructions.append(l.gpa, inst);
+    }
+
+    /// Splits the name `data[b..e]` on '.' and appends a pre-hashed `PathSeg`
+    /// per segment, returning the (start, count) run for the `write_path`
+    /// instruction. The implicit iterator `{{.}}` and empty tags carry no
+    /// segments (count 0), told apart by the instruction's `name_len`.
+    fn appendPathSegs(l: *Loader, b: u32, e: u32) LoadError!struct { start: u32, count: u32 } {
+        const start: u32 = @intCast(l.path_segs.items.len);
+        const name = l.data.items[b..e];
+        if (name.len == 0 or (name.len == 1 and name[0] == '.'))
+            return .{ .start = start, .count = 0 };
+        var seg_pos: u32 = b;
+        var rest = name;
+        while (true) {
+            const dot = std.mem.indexOfScalar(u8, rest, '.');
+            const seg_len: u32 = if (dot) |d| @intCast(d) else @intCast(rest.len);
+            try l.path_segs.append(l.gpa, .{
+                .hash = context.fieldHash(rest[0..seg_len]),
+                .pos = seg_pos,
+                .len = seg_len,
+            });
+            if (dot) |d| {
+                rest = rest[d + 1 ..];
+                seg_pos += seg_len + 1;
+            } else break;
+        }
+        return .{ .start = start, .count = @intCast(l.path_segs.items.len - start) };
     }
 
     /// Emits text as `write_text` instructions, splitting at newlines and
@@ -409,8 +480,8 @@ const Loader = struct {
         }
 
         if (beg == end) {
-            // Empty tag; emit an (unresolvable) empty-named argument.
-            try l.pushInstruction(.{ .op = .write_arg, .name_pos = beg, .name_len = 0 });
+            // Empty tag; emit an (unresolvable) empty-named path (0 segments).
+            try l.pushInstruction(.{ .op = .write_path, .name_pos = beg, .name_len = 0 });
             return;
         }
 
@@ -558,11 +629,29 @@ const Loader = struct {
                     e -= 1;
                     trim(data, &b, &e);
                 }
-                try l.pushInstruction(.{
-                    .op = if (escaped) .write_arg else .write_arg_unescaped,
-                    .name_pos = b,
-                    .name_len = e - b,
-                });
+                // Classify once, at parse time, so the render hot path never
+                // scans for '.': a non-empty name with no dot is a simple key
+                // (fast field lookup by hash); everything else — dotted, the
+                // implicit `{{.}}`, and empty tags — is a `write_path`.
+                if (e > b and std.mem.indexOfScalar(u8, data[b..e], '.') == null) {
+                    try l.pushInstruction(.{
+                        .op = if (escaped) .write_arg else .write_arg_unescaped,
+                        .name_pos = b,
+                        .name_len = e - b,
+                        // `offset` is unused by simple-key instructions; carry
+                        // the tag name's hash for the renderer's fast lookup.
+                        .offset = context.fieldHash(data[b..e]),
+                    });
+                } else {
+                    const segs = try l.appendPathSegs(b, e);
+                    try l.pushInstruction(.{
+                        .op = if (escaped) .write_path else .write_path_unescaped,
+                        .name_pos = b,
+                        .name_len = e - b,
+                        .offset = segs.start,
+                        .len = segs.count,
+                    });
+                }
             },
         }
     }

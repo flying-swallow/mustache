@@ -149,6 +149,53 @@ recursive partials), `partials`. A parse failure is a compile error.
 - `RenderError` — returned by the streaming `render`: `error{TooDeep}` plus
   `error{WriteFailed}` from the writer.
 
+## Benchmarks
+
+The benchmark renders a small template one million times across three output
+modes — a fixed buffer (`Buffer`), an allocating build (`Alloc`), and a
+discarding writer (`Writer`) — comparing a runtime-parsed and a comptime-parsed
+template against an equivalent `std.fmt` baseline, plus a parse-only pass.
+
+Reproduce with:
+
+```sh
+zig build bench -Doptimize=ReleaseFast
+```
+
+Absolute numbers are machine-specific — the signal is the *ratio* between paths.
+The comptime path is the headline: the template is parsed at compile time, so
+rendering pays zero parse cost and allocates nothing for the template itself,
+landing within ~1.6–2.4× of hand-written `std.fmt` while remaining fully
+data-driven.
+
+Numbers below were taken on an Apple M3 (macOS 15.7, Zig `0.17.0-dev`,
+`ReleaseFast`, 1,000,000 iterations).
+
+### Simple template
+
+| Run                            | Mode   | ns/iter |      ops/s |   MB/s | vs fmt |
+| ------------------------------ | ------ | ------: | ---------: | -----: | -----: |
+| Zig fmt (baseline)             | Buffer |    27.8 |   35921369 | 3871.1 |      - |
+| Mustache pre-parsed (runtime)  | Buffer |    67.3 |   14854960 | 1600.8 |  2.42x |
+| Mustache pre-parsed (comptime) | Buffer |    67.9 |   14735778 | 1588.0 |  2.44x |
+| Zig fmt (baseline)             | Alloc  |    56.0 |   17850064 | 1923.6 |      - |
+| Mustache pre-parsed (runtime)  | Alloc  |    91.7 |   10902609 | 1174.9 |  1.64x |
+| Mustache pre-parsed (comptime) | Alloc  |    86.9 |   11502268 | 1239.5 |  1.55x |
+| Zig fmt (baseline)             | Writer |    25.6 |   38994588 | 4202.3 |      - |
+| Mustache pre-parsed (runtime)  | Writer |    61.2 |   16336466 | 1760.5 |  2.39x |
+| Mustache pre-parsed (comptime) | Writer |    60.3 |   16576429 | 1786.4 |  2.35x |
+
+### Partials
+
+| Run                          | Mode   | ns/iter |     ops/s |   MB/s |
+| ---------------------------- | ------ | ------: | --------: | -----: |
+| Mustache pre-parsed partials | Buffer |   108.8 |   9192222 | 1323.7 |
+| Mustache pre-parsed partials | Alloc  |   142.7 |   7007447 | 1009.1 |
+| Mustache pre-parsed partials | Writer |   121.1 |   8259750 | 1189.4 |
+
+Parsing a small multi-section template (compile + discard) runs at ~453 ns/iter
+(≈2.2M ops/s), a cost the comptime path removes entirely.
+
 ## Testing
 
 ```sh
