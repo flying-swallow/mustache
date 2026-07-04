@@ -53,8 +53,8 @@ pub const Mustache = struct {
     }
 
     /// Compiles a template from in-memory data; `deinit()` frees it.
-    /// Partials referenced by the template fail with `error.FileNotFound`
-    /// (use `init` with an `io` to support them).
+    /// Partials referenced by the template render as the empty string
+    /// (use `init` with `partials` or an `io` to support them).
     pub fn fromData(allocator: Allocator, data: []const u8) Error!Mustache {
         return init(allocator, .{ .data = data });
     }
@@ -72,19 +72,77 @@ pub const Mustache = struct {
     /// Renders the template against `data` (a struct). Returns the rendered
     /// text; the caller owns it and frees it with `allocator.free`.
     pub fn build(self: *const Mustache, allocator: Allocator, data: anytype) BuildError![]const u8 {
-        if (@typeInfo(@TypeOf(data)) != .@"struct") {
-            @compileError("No struct: '" ++ @typeName(@TypeOf(data)) ++ "'");
-        }
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer arena_state.deinit();
-        const root = try valueify(arena_state.allocator(), data);
-
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try render.render(&self.template, &root, allocator, &out);
-        return out.toOwnedSlice(allocator);
+        return renderAlloc(allocator, &self.template, data);
     }
 };
+
+/// Renders an already-compiled `template` against `data` (a struct). Returns
+/// the rendered text; the caller owns it and frees it with `allocator.free`.
+/// Works with both runtime-compiled templates (`parser.load`) and
+/// comptime-compiled ones (`comptimeTemplate`).
+pub fn renderAlloc(
+    allocator: Allocator,
+    template: *const parser.Template,
+    data: anytype,
+) render.RenderError![]const u8 {
+    if (@typeInfo(@TypeOf(data)) != .@"struct") {
+        @compileError("No struct: '" ++ @typeName(@TypeOf(data)) ++ "'");
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const root = try valueify(arena_state.allocator(), data);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try render.render(template, &root, allocator, &out);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Arguments for compiling a template at comptime. Only in-memory sources are
+/// supported (the filesystem is unreachable at comptime); load file contents
+/// via `@embedFile`.
+pub const ComptimeArgs = struct {
+    /// Template contents.
+    data: []const u8,
+    /// Names the (virtual) root template, enabling recursive partials that
+    /// reference it.
+    filename: []const u8 = "",
+    /// Named in-memory partials.
+    partials: []const parser.Partial = &.{},
+};
+
+/// Compiles a template at compile time into a const-backed `parser.Template`,
+/// with zero runtime parsing cost and no allocation for the template itself.
+/// Render it with `renderAlloc`. Any parse failure is a compile error.
+///
+/// ```zig
+/// const tmpl = comptime mustache.comptimeTemplate(.{ .data = "Hello {{name}}!" });
+/// const out = try mustache.renderAlloc(alloc, &tmpl, .{ .name = "World" });
+/// defer alloc.free(out);
+/// ```
+pub fn comptimeTemplate(comptime opts: ComptimeArgs) parser.Template {
+    return @import("comptime_parse.zig").parse(opts.data, opts.filename, opts.partials);
+}
+
+/// A type wrapper around a comptime-compiled template, mirroring the runtime
+/// `Mustache` ergonomics without any allocation or `deinit` for parsing.
+///
+/// ```zig
+/// const T = mustache.Comptime(.{ .data = "Hello {{name}}!" });
+/// const out = try T.build(alloc, .{ .name = "World" });
+/// defer alloc.free(out);
+/// ```
+pub fn Comptime(comptime opts: ComptimeArgs) type {
+    return struct {
+        /// The compiled template, available as a compile-time constant.
+        pub const template = comptimeTemplate(opts);
+
+        /// Renders the template against `data` (a struct); caller frees.
+        pub fn build(allocator: Allocator, data: anytype) render.RenderError![]const u8 {
+            return renderAlloc(allocator, &template, data);
+        }
+    };
+}
 
 /// Converts any Zig value into a `Value` tree allocated in `arena`. Strings
 /// are duplicated, so the result does not alias the input.
@@ -162,9 +220,4 @@ pub fn valueify(arena: Allocator, value: anytype) Allocator.Error!Value {
         },
         else => @compileError("Unable to valueify type '" ++ @typeName(T) ++ "'"),
     }
-}
-
-test {
-    _ = @import("tests.zig");
-    _ = @import("mustachejs_tests.zig");
 }

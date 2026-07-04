@@ -13,7 +13,7 @@ const Allocator = std.mem.Allocator;
 pub const NESTING_LIMIT = 82;
 
 /// Delimiters may be at most 4 bytes long (the C limit of 5 included a NUL).
-const DELIMITER_MAX = 4;
+pub const DELIMITER_MAX = 4;
 
 /// Sentinel for instructions that carry no name. The C implementation used
 /// `name_pos == 0`, which was unambiguous only because position 0 always fell
@@ -53,8 +53,8 @@ pub const Instruction = struct {
 /// A compiled template: an instruction array plus the concatenated text of
 /// the root template and every partial it pulled in.
 pub const Template = struct {
-    instructions: []Instruction,
-    data: []u8,
+    instructions: []const Instruction,
+    data: []const u8,
 
     pub fn deinit(self: *Template, allocator: Allocator) void {
         allocator.free(self.instructions);
@@ -85,7 +85,7 @@ pub const LoadError = error{
 /// is read from `filename`, which requires `io`. Partials are resolved
 /// against `partials` first, then loaded from the filesystem relative to the
 /// including template's directory (which requires `io`); unresolved partials
-/// fail with `error.FileNotFound`.
+/// render as the empty string (per the mustache spec).
 pub fn load(
     gpa: Allocator,
     io: ?std.Io,
@@ -127,7 +127,7 @@ pub fn load(
 /// One template on the loader stack, parsed LIFO: encountering a partial
 /// pushes a frame and parsing resumes with the partial's text; when it
 /// completes, the including template continues where it left off.
-const Frame = struct {
+pub const Frame = struct {
     /// Index into `Loader.segments`.
     segment: u32,
     data_start: u32,
@@ -143,7 +143,7 @@ const Frame = struct {
 
 /// One loaded template file/blob; used to resolve relative partial paths and
 /// to reuse already-compiled templates (via `section_goto`).
-const Segment = struct {
+pub const Segment = struct {
     /// Resolved path (or the caller-provided name), arena-owned.
     filename: []const u8,
     /// Length of the directory prefix of `filename`, including the '/'.
@@ -472,7 +472,12 @@ const Loader = struct {
                 var b = beg + 1;
                 var e = end;
                 trim(data, &b, &e);
-                const loaded = try l.loadFile(data[b..e]);
+                // Per the mustache spec, a partial that cannot be resolved
+                // renders as the empty string.
+                const loaded = l.loadFile(data[b..e]) catch |err| switch (err) {
+                    error.FileNotFound => 0,
+                    else => return err,
+                };
                 if (pad_len > 0) {
                     if (loaded > 0) {
                         // Initial padding, written when the partial starts.
@@ -589,8 +594,23 @@ const Loader = struct {
     }
 };
 
-/// Trims whitespace from both ends of `data[b..e]` in place.
-fn trim(data: []const u8, b: *u32, e: *u32) void {
-    while (b.* < e.* and std.ascii.isWhitespace(data[b.*])) b.* += 1;
-    while (e.* > b.* and std.ascii.isWhitespace(data[e.* - 1])) e.* -= 1;
+/// Trims whitespace from both ends of `data[b..e]` in place. A U+FEFF (BOM)
+/// also counts as whitespace, matching JavaScript's `\s` (and therefore
+/// mustache.js's tag-name trimming).
+pub fn trim(data: []const u8, b: *u32, e: *u32) void {
+    const bom = "\u{FEFF}";
+    while (b.* < e.*) {
+        if (std.ascii.isWhitespace(data[b.*])) {
+            b.* += 1;
+        } else if (e.* - b.* >= bom.len and std.mem.eql(u8, data[b.*..][0..bom.len], bom)) {
+            b.* += bom.len;
+        } else break;
+    }
+    while (e.* > b.*) {
+        if (std.ascii.isWhitespace(data[e.* - 1])) {
+            e.* -= 1;
+        } else if (e.* - b.* >= bom.len and std.mem.eql(u8, data[e.* - bom.len ..][0..bom.len], bom)) {
+            e.* -= bom.len;
+        } else break;
+    }
 }

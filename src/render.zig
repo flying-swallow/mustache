@@ -153,22 +153,20 @@ const Renderer = struct {
     }
 
     /// Looks up `name` in the current section and its parents (walking
-    /// towards the root), then falls back to dot notation: the head resolves
-    /// against the section tree and the rest descends into nested objects,
-    /// preferring the longest literal key at each step.
+    /// towards the root). Dotted names split strictly at every dot (per the
+    /// mustache spec they are never literal keys): the head resolves against
+    /// the section tree and each remaining segment descends one object level.
     fn findValue(r: *const Renderer, name: []const u8) ?*const Value {
         // Implicit iterator: `{{.}}` resolves to the current context itself.
         if (name.len == 1 and name[0] == '.') return r.frames[r.index].context;
-        if (r.lookupTree(name)) |v| return v;
-        const first_dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+        const first_dot = std.mem.indexOfScalar(u8, name, '.') orelse return r.lookupTree(name);
         var current = r.lookupTree(name[0..first_dot]) orelse return null;
         var rest = name[first_dot + 1 ..];
-        while (true) {
-            if (getKey(current, rest)) |v| return v;
-            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+        while (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
             current = getKey(current, rest[0..dot]) orelse return null;
             rest = rest[dot + 1 ..];
         }
+        return getKey(current, rest);
     }
 
     /// Searches the frame stack from the current section towards the root,
@@ -217,28 +215,16 @@ const Renderer = struct {
         try r.writeText(text, escape);
     }
 
-    /// Writes text to the output, HTML-escaping if requested and repeating
-    /// the active padding after every newline (so multi-line values inside
-    /// indented partials stay aligned).
+    /// Writes text to the output, HTML-escaping if requested. Padding
+    /// (partial indentation) is never injected here: per the mustache spec,
+    /// indentation applies to the partial's own lines, not to lines inside
+    /// interpolated values.
     fn writeText(r: *Renderer, text: []const u8, escape: bool) Allocator.Error!void {
         if (escape) {
-            for (text) |c| {
-                if (c == '\n' and r.padding != 0) {
-                    try r.out.append(r.gpa, '\n');
-                    try r.writePadding();
-                } else {
-                    try r.out.appendSlice(r.gpa, html_escape_table[c]);
-                }
-            }
+            for (text) |c| try r.out.appendSlice(r.gpa, html_escape_table[c]);
             return;
         }
-        var rest = text;
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-            try r.out.appendSlice(r.gpa, rest[0 .. nl + 1]);
-            try r.writePadding();
-            rest = rest[nl + 1 ..];
-        }
-        if (rest.len > 0) try r.out.appendSlice(r.gpa, rest);
+        try r.out.appendSlice(r.gpa, text);
     }
 };
 
