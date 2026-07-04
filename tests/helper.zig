@@ -56,19 +56,15 @@ pub fn expectRenderPartialComptime(
     try expectRenderComptime(template, &.{.{ .name = "partial", .data = partial }}, data, expected);
 }
 
-/// Like `renderAlloc`, but without its struct-only restriction: several spec
-/// cases use a bare string/int/array as the top-level data.
+/// Uses `renderAlloc` directly (rather than `Mustache.build`) because it has
+/// no struct-only restriction: several spec cases use a bare string/int/array
+/// as the top-level data.
 fn expectRendered(
     template: *const mustache.parser.Template,
     data: anytype,
     expected: []const u8,
 ) !void {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const root = try mustache.valueify(arena_state.allocator(), data);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    try mustache.render.render(template, &root, alloc, &out);
-    try std.testing.expectEqualStrings(expected, out.items);
+    const rendered = try mustache.renderAlloc(alloc, template, data);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(expected, rendered);
 }

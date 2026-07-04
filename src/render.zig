@@ -2,58 +2,50 @@
 //!
 //! Port of facil.io's `mustache_parser.h` build phase and the FIOBJ callback
 //! layer from `fiobj_mustache.c` (MIT, Boaz Segev 2018-2019), with the FIOBJ
-//! object tree replaced by `Value`.
+//! object tree replaced by type-erased `Context` views over the user's data
+//! (see `context.zig`).
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const parser = @import("parser.zig");
+const context = @import("context.zig");
 const Template = parser.Template;
 const Instruction = parser.Instruction;
+const Context = context.Context;
 
-/// Dynamic value tree that templates are rendered against.
-pub const Value = union(enum) {
-    null,
-    bool: bool,
-    int: i64,
-    float: f64,
-    string: []const u8,
-    array: []const Value,
-    object: std.StringHashMapUnmanaged(Value),
-};
-
-pub const RenderError = error{TooDeep} || Allocator.Error;
+pub const Error = error{TooDeep} || std.Io.Writer.Error;
 
 const RenderFrame = struct {
-    context: *const Value,
+    context: Context,
     /// The section's resolved value, cached when the section is entered.
-    section: ?*const Value,
+    section: ?Context,
     /// Instruction index of the section's `section_start`.
     start: u32,
     /// Instruction index of the matching `section_end`.
     end: u32,
     /// Current loop iteration.
-    idx: u32,
+    idx: usize,
     /// Number of iterations to perform.
-    count: u32,
+    count: usize,
 };
 
-/// Renders a compiled template against `root`, appending to `out`.
+/// Renders a compiled template against `data` (any renderable Zig value),
+/// streaming into `out`. Nothing is flushed; the caller owns the writer's
+/// buffering.
 ///
 /// The instruction array behaves like machine code that can loop (sections)
 /// and jump (reused partials), so this is a small VM with an explicit frame
 /// stack rather than recursion.
-pub fn render(
-    template: *const Template,
-    root: *const Value,
-    gpa: Allocator,
-    out: *std.ArrayList(u8),
-) RenderError!void {
+pub fn render(template: *const Template, data: anytype, out: *std.Io.Writer) Error!void {
+    const root: Context = if (comptime context.isComptimeOnly(@TypeOf(data)))
+        comptime context.comptimeValue(data)
+    else
+        Context.init(&data);
+
     const insts = template.instructions;
-    const data = template.data;
+    const bytes = template.data;
     var r: Renderer = .{
         .insts = insts,
-        .data = data,
-        .gpa = gpa,
+        .data = bytes,
         .out = out,
     };
     r.frames[0] = .{
@@ -69,9 +61,9 @@ pub fn render(
     while (pos < insts.len) : (pos += 1) {
         const inst = insts[pos];
         switch (inst.op) {
-            .write_text => try r.writeRaw(data[inst.name_pos..][0..inst.name_len]),
-            .write_arg => try r.writeArg(data[inst.name_pos..][0..inst.name_len], true),
-            .write_arg_unescaped => try r.writeArg(data[inst.name_pos..][0..inst.name_len], false),
+            .write_text => try out.writeAll(bytes[inst.name_pos..][0..inst.name_len]),
+            .write_arg => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], true),
+            .write_arg_unescaped => try r.writeArg(bytes[inst.name_pos..][0..inst.name_len], false),
             .section_goto, .section_start, .section_start_inv => {
                 if (r.index + 1 >= parser.NESTING_LIMIT) return error.TooDeep;
                 r.index += 1;
@@ -85,18 +77,10 @@ pub fn render(
                     .count = 1,
                 };
                 if (inst.name_pos != parser.NO_NAME) {
-                    const name = data[inst.name_pos..][0..inst.name_len];
+                    const name = bytes[inst.name_pos..][0..inst.name_len];
                     frame.section = r.findValue(name);
                     // Truthiness matches mustache.js: '', 0 and NaN are falsy.
-                    var count: u32 = if (frame.section) |v| switch (v.*) {
-                        .null => 0,
-                        .bool => |b| @intFromBool(b),
-                        .array => |a| @intCast(a.len),
-                        .int => |n| @intFromBool(n != 0),
-                        .float => |n| @intFromBool(n != 0 and !std.math.isNan(n)),
-                        .string => |s| @intFromBool(s.len != 0),
-                        .object => 1,
-                    } else 0;
+                    var count: usize = if (frame.section) |v| v.count() else 0;
                     if (inst.op == .section_start_inv) count = @intFromBool(count == 0);
                     frame.count = count;
                 }
@@ -113,8 +97,7 @@ pub fn render(
 const Renderer = struct {
     insts: []const Instruction,
     data: []const u8,
-    gpa: Allocator,
-    out: *std.ArrayList(u8),
+    out: *std.Io.Writer,
     frames: [parser.NESTING_LIMIT]RenderFrame = undefined,
     index: usize = 0,
     /// Instruction index of the active `padding_push` (0 = none).
@@ -131,17 +114,12 @@ const Renderer = struct {
             const start_inst = r.insts[pos];
             if (start_inst.name_pos != parser.NO_NAME) {
                 // Entering a named section: the section's value (an array
-                // element for array sections) becomes the context. Inverted
-                // sections over a missing key keep the parent context (the C
-                // version aborted rendering here, against the mustache spec).
+                // element for array sections) becomes the context. An
+                // inverted section over an empty array still runs once;
+                // there is no element (`element` returns null), so the
+                // parent context (already in `frame.context`) stays active.
                 if (frame.section) |v| {
-                    frame.context = switch (v.*) {
-                        // An inverted section over an empty array still runs
-                        // once; there is no element, so the parent context
-                        // (already in `frame.context`) stays active.
-                        .array => |a| if (frame.idx < a.len) &a[frame.idx] else frame.context,
-                        else => v,
-                    };
+                    if (v.element(frame.idx)) |elem| frame.context = elem;
                 }
             }
             if (start_inst.op == .section_goto) pos += 1;
@@ -156,107 +134,49 @@ const Renderer = struct {
     /// towards the root). Dotted names split strictly at every dot (per the
     /// mustache spec they are never literal keys): the head resolves against
     /// the section tree and each remaining segment descends one object level.
-    fn findValue(r: *const Renderer, name: []const u8) ?*const Value {
+    fn findValue(r: *const Renderer, name: []const u8) ?Context {
         // Implicit iterator: `{{.}}` resolves to the current context itself.
         if (name.len == 1 and name[0] == '.') return r.frames[r.index].context;
         const first_dot = std.mem.indexOfScalar(u8, name, '.') orelse return r.lookupTree(name);
         var current = r.lookupTree(name[0..first_dot]) orelse return null;
         var rest = name[first_dot + 1 ..];
         while (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
-            current = getKey(current, rest[0..dot]) orelse return null;
+            current = current.getKey(rest[0..dot]) orelse return null;
             rest = rest[dot + 1 ..];
         }
-        return getKey(current, rest);
+        return current.getKey(rest);
     }
 
     /// Searches the frame stack from the current section towards the root,
     /// skipping repeated contexts, for an object containing `name`.
-    fn lookupTree(r: *const Renderer, name: []const u8) ?*const Value {
+    fn lookupTree(r: *const Renderer, name: []const u8) ?Context {
         var i = r.index;
-        var previous: ?*const Value = null;
+        var previous: ?Context = null;
         while (true) : (i -= 1) {
-            const context = r.frames[i].context;
-            if (context != previous) {
-                if (getKey(context, name)) |v| return v;
-                previous = context;
+            const ctx = r.frames[i].context;
+            const repeated = if (previous) |p| ctx.eql(p) else false;
+            if (!repeated) {
+                if (ctx.getKey(name)) |v| return v;
+                previous = ctx;
             }
             if (i == 0) return null;
         }
     }
 
-    fn writeRaw(r: *Renderer, text: []const u8) Allocator.Error!void {
-        try r.out.appendSlice(r.gpa, text);
-    }
-
-    fn writePadding(r: *Renderer) Allocator.Error!void {
+    fn writePadding(r: *Renderer) std.Io.Writer.Error!void {
         var i = r.padding;
         while (i != 0) : (i = r.insts[i].end) {
             const inst = r.insts[i];
-            try r.writeRaw(r.data[inst.name_pos..][0..inst.name_len]);
+            try r.out.writeAll(r.data[inst.name_pos..][0..inst.name_len]);
         }
     }
 
-    /// Resolves an argument and writes its value as text.
-    fn writeArg(r: *Renderer, name: []const u8, escape: bool) Allocator.Error!void {
-        const v = r.findValue(name) orelse return;
-        // Large enough for any f64 in decimal notation.
-        var buf: [1024]u8 = undefined;
-        const text: []const u8 = switch (v.*) {
-            .null => return,
-            .string => |s| s,
-            .int => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable,
-            .float => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable,
-            .bool => |b| if (b) "true" else "false",
-            // Composite values have no text form (the C version serialized
-            // them as JSON; templates that rely on that are not supported).
-            .array, .object => return,
-        };
-        if (text.len == 0) return;
-        try r.writeText(text, escape);
-    }
-
-    /// Writes text to the output, HTML-escaping if requested. Padding
-    /// (partial indentation) is never injected here: per the mustache spec,
+    /// Resolves an argument and writes its value as text. Padding (partial
+    /// indentation) is never injected here: per the mustache spec,
     /// indentation applies to the partial's own lines, not to lines inside
     /// interpolated values.
-    fn writeText(r: *Renderer, text: []const u8, escape: bool) Allocator.Error!void {
-        if (escape) {
-            for (text) |c| try r.out.appendSlice(r.gpa, html_escape_table[c]);
-            return;
-        }
-        try r.out.appendSlice(r.gpa, text);
+    fn writeArg(r: *Renderer, name: []const u8, escape: bool) std.Io.Writer.Error!void {
+        const v = r.findValue(name) orelse return;
+        try v.write(r.out, escape);
     }
 };
-
-fn getKey(v: *const Value, key: []const u8) ?*const Value {
-    if (v.* != .object) return null;
-    return v.object.getPtr(key);
-}
-
-/// The exact escape table of mustache.js's `entityMap`: the HTML
-/// metacharacters plus backtick, '=' and '/' are replaced, everything else
-/// passes through.
-const html_escape_table: [256][]const u8 = blk: {
-    @setEvalBranchQuota(10_000);
-    var table: [256][]const u8 = undefined;
-    for (0..256) |i| {
-        table[i] = switch (i) {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&#39;",
-            '`' => "&#x60;",
-            '=' => "&#x3D;",
-            '/' => "&#x2F;",
-            else => single(i),
-        };
-    }
-    break :blk table;
-};
-
-fn single(comptime i: usize) []const u8 {
-    const c = [1]u8{@intCast(i)};
-    const copy = c;
-    return &copy;
-}

@@ -222,7 +222,7 @@ test "sections over scalars use mustache.js truthiness" {
     );
 }
 
-test "tuples valueify as arrays" {
+test "tuples render as arrays" {
     try expectRender(
         "{{#list}}[{{.}}]{{/list}}",
         &.{},
@@ -346,6 +346,43 @@ test "unbounded recursion fails with TooDeep" {
     try std.testing.expectError(error.TooDeep, m.build(alloc, .{ .child = .{ .x = 1 } }));
 }
 
+test "streaming render into a fixed writer" {
+    var m = try Mustache.fromData(alloc, "Hello {{name}}!");
+    defer m.deinit();
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try m.render(.{ .name = "World" }, &w);
+    try std.testing.expectEqualStrings("Hello World!", w.buffered());
+}
+
+const Node = struct {
+    name: []const u8,
+    children: []const Node,
+};
+
+const node_tree: Node = .{ .name = "a", .children = &.{
+    .{ .name = "b", .children = &.{
+        .{ .name = "d", .children = &.{} },
+    } },
+    .{ .name = "c", .children = &.{} },
+} };
+
+test "recursive data through a recursive partial" {
+    var m = try Mustache.init(alloc, .{
+        .filename = "root",
+        .data = "{{name}}[{{#children}}{{> root}}{{/children}}]",
+    });
+    defer m.deinit();
+    const rendered = try m.build(alloc, node_tree);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings("a[b[d[]]c[]]", rendered);
+}
+
+test "non-UTF-8 byte slices iterate as arrays" {
+    try expectRender("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(255)(1)");
+    try expectRenderComptime("{{#b}}({{.}}){{/b}}", &.{}, .{ .b = "\xff\x01" }, "(255)(1)");
+}
+
 test "load errors" {
     try std.testing.expectError(error.ClosureMismatch, Mustache.fromData(alloc, "{{name"));
     try std.testing.expectError(error.ClosureMismatch, Mustache.fromData(alloc, "{{#a}}no closing tag"));
@@ -395,6 +432,18 @@ test "comptime: recursive template via virtual root" {
     const rendered = try T.build(alloc, .{ .child = .{ .child = false } });
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings("AABB", rendered);
+}
+
+test "comptime: recursive data through a recursive partial" {
+    // The case that forces type-erased contexts: a comptime template whose
+    // partial recursion depth depends on runtime data.
+    const T = mustache.Comptime(.{
+        .filename = "root",
+        .data = "{{name}}[{{#children}}{{> root}}{{/children}}]",
+    });
+    const rendered = try T.build(alloc, node_tree);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings("a[b[d[]]c[]]", rendered);
 }
 
 test "comptime: unbounded recursion fails at render time with TooDeep" {

@@ -36,8 +36,8 @@ defer allocator.free(rendered);
 ## API reference
 
 The module's root (`@import("mustache")`) exposes the `Mustache` type, the
-comptime helpers (`Comptime`, `comptimeTemplate`), the low-level `renderAlloc`
-and `valueify` functions, and the `Value` union.
+comptime helpers (`Comptime`, `comptimeTemplate`), and the low-level `render`
+(streaming) and `renderAlloc` functions.
 
 ### Compiling a template
 
@@ -84,19 +84,33 @@ const out = try m.build(allocator, .{ .name = "World" });
 defer allocator.free(out);
 ```
 
-The `data` argument must be a struct. Its values are converted with
-`valueify`:
+The `data` argument must be a struct. There is no intermediate value tree:
+rendering reads the data in place through accessors generated at compile time
+for its type.
 
 | Zig value                     | Mustache meaning                         |
 | ----------------------------- | ---------------------------------------- |
 | struct with fields            | object (fields addressable via `{{a.b}}`) |
 | tuple / slice / array         | iterable list (for `{{#items}}`)         |
-| `[]const u8` (valid UTF-8)    | string                                   |
+| `[]const u8` (valid UTF-8)    | string (otherwise a list of bytes)       |
 | optional                      | present value, or absent (`null`)        |
 | `bool`                        | truthy / falsy for sections              |
 | int / float                   | number                                   |
 | enum                          | its integer value                        |
 | tagged union                  | its active payload                       |
+| error value                   | its name as a string                     |
+
+To stream instead of allocating, render into any `std.Io.Writer`:
+
+```zig
+var w: std.Io.Writer = .fixed(&buf); // or a file/socket writer
+try m.render(.{ .name = "World" }, &w);
+```
+
+Nothing is flushed; the caller owns the writer's buffering. The free function
+`mustache.render(&template, data, writer)` does the same for an
+already-compiled template, and neither restricts `data` to a struct — a bare
+string, number or list also works as the root value.
 
 ### Comptime templates
 
@@ -129,9 +143,11 @@ recursive partials), `partials`. A parse failure is a compile error.
 
 - `Mustache.Error` (`parser.LoadError`) — returned by the constructors when a
   template fails to compile or a partial cannot be loaded.
-- `Mustache.BuildError` (`render.RenderError`) — returned by `build` /
+- `Mustache.BuildError` (`RenderAllocError`) — returned by `build` /
   `renderAlloc`: `error{TooDeep}` (section/partial nesting limit) plus
   allocation failure.
+- `RenderError` — returned by the streaming `render`: `error{TooDeep}` plus
+  `error{WriteFailed}` from the writer.
 
 ## Testing
 
